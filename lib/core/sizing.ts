@@ -18,6 +18,9 @@ export interface RiskConfig {
   minArbReturn: number; // min expected return on capital per funded tranche
   allowConditionalArb: boolean; // buy-all-YES sets that fail if an unlisted party wins
   minConvergence: number; // min P(listed party wins) for a conditional set
+  arbUnwind: boolean; // sell a held set back early once most of its locked profit is executable
+  arbUnwindCapture: number; // fraction of the locked profit per set that must be executable
+  arbUnwindMinPp: number; // and at least this much profit per set (probability points)
 }
 
 export const DEFAULT_RISK: RiskConfig = {
@@ -31,12 +34,15 @@ export const DEFAULT_RISK: RiskConfig = {
   maxDrawdown: 0.2,
   minQuantity: 10,
   headlineMultiplier: 1.5,
-  maxArbitragePct: 0.6,
-  maxArbRacePct: 0.25,
-  cashReservePct: 0.05,
+  maxArbitragePct: 0.9,
+  maxArbRacePct: 0.5,
+  cashReservePct: 0.02,
   minArbReturn: 0.005,
   allowConditionalArb: false,
   minConvergence: 0.97,
+  arbUnwind: true,
+  arbUnwindCapture: 0.6,
+  arbUnwindMinPp: 0.002,
 };
 
 export interface PortfolioView {

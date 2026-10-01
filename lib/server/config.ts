@@ -17,9 +17,16 @@ export const config = {
   readsPerMinute: num("SIG_READS_PER_MIN", 100),
   writesPerMinute: num("SIG_WRITES_PER_MIN", 30),
   rateSafety: num("SIG_RATE_SAFETY", 0.85),
-  requestTimeoutMs: num("SIG_TIMEOUT_MS", 10_000),
+  requestTimeoutMs: num("SIG_TIMEOUT_MS", 8_000),
 
-  priceIntervalSec: num("PRICE_POLL_SEC", 5),
+  /** fast loop: top of book for the "hot" markets (positions, arbitrage races, live signals) */
+  priceIntervalSec: num("PRICE_POLL_SEC", 2),
+  /** top of book for the whole universe (ceil(N/100) reads) */
+  universeIntervalSec: num("UNIVERSE_POLL_SEC", 6),
+  /** refetch depth of a hot market at least this often */
+  hotDepthMaxAgeSec: num("HOT_DEPTH_MAX_AGE_SEC", 10),
+  /** parallel depth requests per tick */
+  depthConcurrency: num("DEPTH_CONCURRENCY", 4),
   externalIntervalSec: num("EXTERNAL_POLL_SEC", 90),
   newsMarketsPerMinute: num("NEWS_MARKETS_PER_MIN", 12),
   marketsRefreshSec: num("MARKETS_REFRESH_SEC", 600),

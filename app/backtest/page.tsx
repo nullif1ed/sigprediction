@@ -64,11 +64,11 @@ interface Detail {
 
 const DEFAULT_FORM = {
   name: "baseline",
-  description: "Pre-Day-1 defaults",
+  description: "Day-1 tuned defaults",
   minNetEdge: 0.01,
   minConfidence: 0.4,
-  profitTarget: 0.02,
-  stopLoss: 0.02,
+  takeProfitPp: 0.01,
+  stopLossPp: 0.04,
   minDaysToResolution: 1,
   kellyFraction: 0.25,
   fixedFraction: 0.01,
@@ -92,7 +92,8 @@ function toRequest(f: Form) {
       minConfidence: f.minConfidence,
       headlineTrading: f.headlineTrading,
       arbitrage: f.arbitrage,
-      exits: { profitTarget: f.profitTarget, stopLoss: f.stopLoss, minDaysToResolution: f.minDaysToResolution },
+      // Absolute targets in probability points; the relative fallbacks are disabled for form runs.
+      exits: { takeProfitPp: f.takeProfitPp, profitTarget: 1, stopLossPp: f.stopLossPp, stopLoss: 0, minDaysToResolution: f.minDaysToResolution },
       risk: { kellyFraction: f.kellyFraction, fixedFraction: f.fixedFraction, maxPositionPct: f.maxPositionPct },
       basedOn: f.basedOn || null,
     },
@@ -113,8 +114,8 @@ function fromConfig(name: string, cfg: Record<string, unknown>, id: string): For
     description: `Based on ${name}`,
     minNetEdge: Number(cfg.minNetEdge ?? DEFAULT_FORM.minNetEdge),
     minConfidence: Number(cfg.minConfidence ?? DEFAULT_FORM.minConfidence),
-    profitTarget: ex.profitTarget ?? DEFAULT_FORM.profitTarget,
-    stopLoss: ex.stopLoss ?? DEFAULT_FORM.stopLoss,
+    takeProfitPp: ex.takeProfitPp ?? DEFAULT_FORM.takeProfitPp,
+    stopLossPp: ex.stopLossPp ?? DEFAULT_FORM.stopLossPp,
     minDaysToResolution: ex.minDaysToResolution ?? DEFAULT_FORM.minDaysToResolution,
     kellyFraction: rk.kellyFraction ?? DEFAULT_FORM.kellyFraction,
     fixedFraction: rk.fixedFraction ?? DEFAULT_FORM.fixedFraction,
@@ -177,8 +178,8 @@ export default function Backtest() {
           </label>
           <Num label="Min net edge" k="minNetEdge" form={form} set={setForm} />
           <Num label="Min confidence" k="minConfidence" form={form} set={setForm} step={0.05} />
-          <Num label="Profit target" k="profitTarget" form={form} set={setForm} />
-          <Num label="Stop loss" k="stopLoss" form={form} set={setForm} />
+          <Num label="Take profit (pp)" k="takeProfitPp" form={form} set={setForm} />
+          <Num label="Stop loss (pp)" k="stopLossPp" form={form} set={setForm} />
           <Num label="Exit days before res." k="minDaysToResolution" form={form} set={setForm} step={1} />
           <Num label="Kelly fraction" k="kellyFraction" form={form} set={setForm} step={0.05} />
           <Num label="Fixed fraction" k="fixedFraction" form={form} set={setForm} step={0.005} />

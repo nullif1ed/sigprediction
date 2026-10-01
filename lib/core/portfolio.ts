@@ -31,6 +31,13 @@ export class Portfolio {
   maxDrawdown = 0;
   private pos = new Map<string, Position>(); // key marketId:contract
   raceOf: (marketId: string) => string = (m) => m;
+  /**
+   * Shares locked in arbitrage sets, per marketId:contract, with their cost. Regular exits never
+   * sell these, and regular trades never net against them; they leave only by a full-set unwind.
+   */
+  arb = new Map<string, { quantity: number; cost: number }>();
+  /** marketId -> epoch ms until which new regular entries are blocked (after a stop loss) */
+  cooldownUntil = new Map<string, number>();
 
   constructor(initialCapital: number) {
     this.cash = initialCapital;
@@ -48,6 +55,43 @@ export class Portfolio {
 
   holdings(marketId: string) {
     return { YES: this.get(marketId, "YES")?.quantity ?? 0, NO: this.get(marketId, "NO")?.quantity ?? 0 };
+  }
+
+  /** Holdings available to regular trading (arbitrage-locked shares excluded). */
+  freeHoldings(marketId: string) {
+    const h = this.holdings(marketId);
+    return { YES: Math.max(0, h.YES - this.arbQty(marketId, "YES")), NO: Math.max(0, h.NO - this.arbQty(marketId, "NO")) };
+  }
+
+  arbQty(marketId: string, contract: Contract): number {
+    return Math.min(this.arb.get(this.key(marketId, contract))?.quantity ?? 0, this.get(marketId, contract)?.quantity ?? 0);
+  }
+
+  arbCost(marketId: string, contract: Contract): number {
+    return this.arb.get(this.key(marketId, contract))?.cost ?? 0;
+  }
+
+  /** Record shares bought (q > 0) or unwound (q < 0) as part of an arbitrage set. */
+  markArb(marketId: string, contract: Contract, q: number, cost: number) {
+    const k = this.key(marketId, contract);
+    const cur = this.arb.get(k) ?? { quantity: 0, cost: 0 };
+    if (q < 0 && cur.quantity > 0) cost = (cur.cost / cur.quantity) * q; // release average cost
+    const next = { quantity: cur.quantity + q, cost: cur.cost + cost };
+    if (next.quantity <= 0) this.arb.delete(k);
+    else this.arb.set(k, next);
+  }
+
+  arbExposure(): number {
+    let s = 0;
+    for (const v of this.arb.values()) s += v.cost;
+    return s;
+  }
+
+  raceArbExposure(marketId: string): number {
+    const race = this.raceOf(marketId);
+    let s = 0;
+    for (const [k, v] of this.arb) if (this.raceOf(k.split(":")[0]) === race) s += v.cost;
+    return s;
   }
 
   positions(): Position[] {
@@ -104,6 +148,9 @@ export class Portfolio {
     };
     p.lots.push({ quantity: qty, price });
     p.quantity += qty;
+    // Adding shares changes the entry price: restart the exit state machine for this position.
+    delete (p as Position & { peakProfitPp?: number }).peakProfitPp;
+    delete (p as Position & { stopStrikes?: number }).stopStrikes;
     p.avgEntry = p.lots.reduce((s, l) => s + l.quantity * l.price, 0) / p.quantity;
     if (meta.fair !== undefined) p.entryFair = meta.fair;
     this.pos.set(k, p);
@@ -204,16 +251,23 @@ export class Portfolio {
       peakEquity: this.peakEquity,
       maxDrawdown: this.maxDrawdown,
       positions: this.positions(),
+      arb: [...this.arb.entries()],
+      cooldownUntil: [...this.cooldownUntil.entries()],
     };
   }
 
-  static fromJSON(j: ReturnType<Portfolio["toJSON"]>): Portfolio {
+  static fromJSON(j: Omit<ReturnType<Portfolio["toJSON"]>, "arb" | "cooldownUntil"> & Partial<Pick<ReturnType<Portfolio["toJSON"]>, "arb" | "cooldownUntil">>): Portfolio {
     const p = new Portfolio(j.initialCapital);
     p.cash = j.cash;
     p.realizedPnl = j.realizedPnl;
     p.peakEquity = j.peakEquity;
     p.maxDrawdown = j.maxDrawdown;
     for (const x of j.positions) p.pos.set(`${x.marketId}:${x.contract}`, { ...x, lots: x.lots.map((l) => ({ ...l })) });
+    if (j.arb) p.arb = new Map(j.arb);
+    else
+      // Portfolios saved before arbitrage tracking: positions opened as arbitrage are fully locked.
+      for (const x of j.positions) if (x.tradeType === "arbitrage") p.arb.set(`${x.marketId}:${x.contract}`, { quantity: x.quantity, cost: costBasis(x) });
+    if (j.cooldownUntil) p.cooldownUntil = new Map(j.cooldownUntil);
     return p;
   }
 }

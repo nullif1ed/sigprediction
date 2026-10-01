@@ -114,14 +114,16 @@ export class SigClient {
     this.closed = true;
   }
 
-  private async request<T>(url: string, opts: { auth: boolean; limiter: RateLimiter }): Promise<T> {
+  private async request<T>(url: string, opts: { auth: boolean; limiter: RateLimiter; timeoutMs?: number; maxRetries?: number }): Promise<T> {
     if (opts.auth && !this.apiKey) throw new SigApiError(401, "MISSING_API_KEY", "SIG_API_KEY is not configured");
+    const timeoutMs = opts.timeoutMs ?? this.timeoutMs;
+    const maxRetries = opts.maxRetries ?? this.maxRetries;
     let attempt = 0;
     for (;;) {
       if (this.closed) throw new SigApiError(0, "CLIENT_CLOSED", "client closed");
       await opts.limiter.acquire();
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
       const started = Date.now();
       try {
         const res = await this.fetchFn(url, {
@@ -143,10 +145,10 @@ export class SigClient {
           const ra = Number(res.headers.get("retry-after") ?? "60");
           opts.limiter.pause((Number.isFinite(ra) ? ra : 60) * 1000);
           log("WARNING", "sig_api", "rate_limited", { url: redact(url), retryAfterSec: ra });
-          if (attempt++ < this.maxRetries) continue;
+          if (attempt++ < maxRetries) continue;
         }
         // Transient server conditions: exponential backoff with jitter.
-        if ((res.status === 503 || res.status === 502 || res.status === 500) && attempt < this.maxRetries) {
+        if ((res.status === 503 || res.status === 502 || res.status === 500) && attempt < maxRetries) {
           const backoff = 100 * 2 ** attempt + Math.random() * 100;
           attempt++;
           log("WARNING", "sig_api", "retry", { url: redact(url), status: res.status, code, backoffMs: Math.round(backoff) });
@@ -159,7 +161,7 @@ export class SigClient {
       } catch (e) {
         if (e instanceof SigApiError) throw e;
         // Network error / timeout: reconnect by retrying with backoff.
-        if (attempt < this.maxRetries) {
+        if (attempt < maxRetries) {
           const backoff = 250 * 2 ** attempt;
           attempt++;
           log("WARNING", "sig_api", "network_retry", { url: redact(url), error: String(e), backoffMs: backoff });
@@ -174,8 +176,8 @@ export class SigClient {
     }
   }
 
-  private api<T>(path: string) {
-    return this.request<T>(`${this.base}${path}`, { auth: true, limiter: this.reads });
+  private api<T>(path: string, o: { timeoutMs?: number; maxRetries?: number } = {}) {
+    return this.request<T>(`${this.base}${path}`, { auth: true, limiter: this.reads, ...o });
   }
 
   account() {
@@ -207,18 +209,22 @@ export class SigClient {
     for (let i = 0; i < exchangeIds.length; i += 100) {
       const q = new URLSearchParams({ ids: exchangeIds.slice(i, i + 100).join(",") });
       if (tournamentId) q.set("tournamentId", tournamentId);
-      const r = await this.api<{ data: PriceSnapshot[] }>(`/exchanges/prices?${q}`);
+      const r = await this.api<{ data: PriceSnapshot[] }>(`/exchanges/prices?${q}`, { timeoutMs: Math.min(this.timeoutMs, 5000), maxRetries: 2 });
       out.push(...r.data);
     }
     return out;
   }
 
+  /**
+   * Depth for one market. Fails fast (short timeout, no retry): a slow depth read must never
+   * stall the polling loop, the next tick simply refetches it.
+   */
   async orderbook(marketId: string, tournamentId?: string, depth = 50): Promise<YesBook | null> {
     const q = new URLSearchParams({ depth: String(depth) });
     if (tournamentId) q.set("tournamentId", tournamentId);
     const r = await this.api<{
       exchanges: { exchangeId: string; asOf: { sequence: number; at: string } | null; bids: Level[]; asks: Level[] }[];
-    }>(`/markets/${encodeURIComponent(marketId)}/orderbook?${q}`);
+    }>(`/markets/${encodeURIComponent(marketId)}/orderbook?${q}`, { timeoutMs: Math.min(this.timeoutMs, 4000), maxRetries: 0 });
     const ex = r.exchanges?.[0];
     if (!ex) return null;
     return normalizeBook({
@@ -248,9 +254,22 @@ export class SigClient {
    * Related-news feed shown on each SIG market page. Not part of the documented v1 API: it is
    * the site's own public endpoint, so its shape may change. Errors are non-fatal for callers.
    */
-  news(marketId: string) {
+  /** epoch ms until which the site news endpoint is skipped (it returns 403 to some hosts) */
+  newsBlockedUntil = 0;
+
+  async news(marketId: string) {
+    if (Date.now() < this.newsBlockedUntil) throw new SigApiError(403, "NEWS_BLOCKED", "news endpoint blocked; backing off");
     const id = encodeURIComponent(marketId);
-    return this.request<RawNews>(`${this.siteBase}/api/markets/${id}/news?marketId=${id}`, { auth: false, limiter: this.site });
+    try {
+      return await this.request<RawNews>(`${this.siteBase}/api/markets/${id}/news?marketId=${id}`, { auth: false, limiter: this.site, timeoutMs: 4000, maxRetries: 0 });
+    } catch (e) {
+      if (e instanceof SigApiError && e.status === 403) {
+        // The site's bot protection blocks this host: stop hammering it for an hour.
+        this.newsBlockedUntil = Date.now() + 60 * 60_000;
+        log("WARNING", "sig_api", "news_blocked", { backoffMinutes: 60 });
+      }
+      throw e;
+    }
   }
 }
 
