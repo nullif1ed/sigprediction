@@ -17,7 +17,8 @@ export interface OrderRequest {
   action: Action;
   quantity: number;
   orderType: "market" | "limit";
-  limitPrice?: number | null; // contract terms
+  /** contract terms. On a market order this is an IOC price protection: never fill beyond it. */
+  limitPrice?: number | null;
   expiresInSec?: number | null;
   tag?: string;
   meta?: OpenMeta;
@@ -101,7 +102,7 @@ export class PaperExecutionClient implements ExecutionClient {
       action: req.action,
       contract: contractOf(req.action),
       orderType: req.orderType,
-      limitPrice: req.orderType === "limit" ? (req.limitPrice ?? null) : null,
+      limitPrice: req.limitPrice ?? null,
       requestedQuantity: Math.floor(req.quantity),
       filledQuantity: 0,
       fillPrice: null,

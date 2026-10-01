@@ -84,3 +84,53 @@ describe("strategy engine", () => {
     expect(pf.holdings("382").NO).toBeGreaterThan(0);
   });
 });
+
+describe("arbitrage bookkeeping (regressions from the 1 Oct paper run)", () => {
+  const arbBooks = () =>
+    new Map([
+      ["381", book("381", [[0.6, 500]], [[0.62, 500]])],
+      ["382", book("382", [[0.45, 500]], [[0.47, 500]])],
+    ]);
+  const tick = (pf: Portfolio, ex: PaperExecutionClient, s: MarketState, cfg = mergeStrategy({ name: "t" })) =>
+    runPortfolioTick({ state: s, signals: computeSignals(s, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
+
+  it("locks arbitrage shares: no regular trade nets against them and exits never sell them", () => {
+    const pf = new Portfolio(100_000);
+    const ex = new PaperExecutionClient(pf);
+    const cfg = mergeStrategy({ name: "t", risk: { ...mergeStrategy({}).risk, arbUnwind: false } });
+    tick(pf, ex, state({ books: arbBooks(), external: new Map() }), cfg);
+    const locked = pf.arbQty("381", "NO");
+    expect(locked).toBe(500);
+    // Market 381 now looks cheap for YES; buying YES would net against (destroy) the NO leg.
+    const s2 = state({ books: new Map([["381", book("381", [[0.7, 5000]], [[0.71, 5000]])], ["382", book("382", [[0.2, 5000]], [[0.25, 5000]])]]) });
+    tick(pf, ex, s2, cfg);
+    expect(pf.holdings("381").NO).toBe(500);
+    expect(pf.arbQty("381", "NO")).toBe(500);
+    expect(pf.holdings("381").YES).toBe(0);
+  });
+
+  it("unwinds a held set early once most of its locked profit is executable", () => {
+    const pf = new Portfolio(100_000);
+    const ex = new PaperExecutionClient(pf);
+    tick(pf, ex, state({ books: arbBooks(), external: new Map() }));
+    const cost = pf.arbExposure();
+    expect(cost).toBeCloseTo(500 * (0.4 + 0.55)); // 500 sets at 0.95, payout 1
+    // YES asks now sum to 1.00: selling both NO legs returns 1.00 per set.
+    const s2 = state({ books: new Map([["381", book("381", [[0.6, 2000]], [[0.61, 2000]])], ["382", book("382", [[0.38, 2000]], [[0.39, 2000]])]]), external: new Map() });
+    const r = tick(pf, ex, s2);
+    expect(r.exits.filter((e) => e.reason === "arb_unwind")).toHaveLength(2);
+    expect(pf.arbQty("381", "NO")).toBe(0);
+    expect(pf.realizedPnl).toBeCloseTo(500 * 0.05, 1);
+  });
+
+  it("restores locked shares from a portfolio saved before arbitrage tracking existed", () => {
+    const pf = new Portfolio(100_000);
+    const ex = new PaperExecutionClient(pf);
+    tick(pf, ex, state({ books: arbBooks(), external: new Map() }));
+    const { arb: _arb, cooldownUntil: _cd, ...legacy } = pf.toJSON();
+    void _arb;
+    void _cd;
+    const restored = Portfolio.fromJSON(legacy);
+    expect(restored.arbQty("381", "NO")).toBe(500);
+  });
+});

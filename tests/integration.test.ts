@@ -121,3 +121,17 @@ describe("collector -> paper trading -> backtest (mock API)", () => {
     expect(["stopped", "completed"]).toContain(sessionDetail(id)!.status);
   });
 });
+
+describe("collector polling priorities", () => {
+  it("flags every leg of a race whose top-of-book YES bids sum to 1 or more", () => {
+    const c = new Collector(new SigClient({ apiKey: "k", fetchFn: (async () => new Response("{}")) as unknown as typeof fetch }));
+    c.raceMembers.set("2026:SENATE:NH", ["381", "382"]);
+    c.raceMembers.set("2026:SENATE:DE", ["353", "386"]);
+    c.tops.set("381", { bid: 0.14, ask: 0.145 });
+    c.tops.set("382", { bid: 0.865, ask: 0.87 });
+    c.tops.set("353", { bid: 0.05, ask: 0.06 });
+    c.tops.set("386", { bid: 0.9, ask: 0.95 });
+    expect(c.arbHintMarkets().sort()).toEqual(["381", "382"]);
+    expect([...c.hotMarkets(Date.now())].sort()).toEqual(["381", "382"]);
+  });
+});
