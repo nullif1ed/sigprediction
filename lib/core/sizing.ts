@@ -139,6 +139,7 @@ export type ScenarioRules = Record<string, { strategy: SizingStrategyName; trade
 export function defaultStrategyFor(scenario: string): SizingStrategyName {
   if (scenario === "arbitrage") return "fixed_fractional";
   if (scenario === "headline") return "volatility_adjusted";
+  if (scenario === "snipe") return "fixed_fractional";
   if (scenario.startsWith("high_edge|high_conf|deep")) return "fractional_kelly";
   if (scenario.includes("low_conf") || scenario.includes("thin")) return "fixed_fractional";
   return "volatility_adjusted";

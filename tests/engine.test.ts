@@ -134,3 +134,23 @@ describe("arbitrage bookkeeping (regressions from the 1 Oct paper run)", () => {
     expect(restored.arbQty("381", "NO")).toBe(500);
   });
 });
+
+describe("sniping mispriced resting orders", () => {
+  it("takes only the depth priced at least snipeEdge through fair, with that price as the limit", () => {
+    // Fair ~0.86 (external). A stray ask at 0.78 for 300 shares, then normal asks at 0.87.
+    const s = state({
+      books: new Map([
+        ["381", book("381", [[0.84, 2000]], [[0.78, 300], [0.87, 5000]])],
+        ["382", book("382", [[0.13, 2000]], [[0.17, 2000]])],
+      ]),
+    });
+    const cfg = mergeStrategy({ name: "t", minNetEdge: 9 }); // isolate the snipe step
+    const pf = new Portfolio(100_000);
+    const ex = new PaperExecutionClient(pf);
+    const r = runPortfolioTick({ state: s, signals: computeSignals(s, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "auto", rules: null, tradedHeadlines: new Set() });
+    const d = r.decisions.find((x) => x.scenario === "snipe" && !x.rejected)!;
+    expect(d.action).toBe("BUY_YES");
+    expect(pf.holdings("381").YES).toBe(300);
+    expect(pf.get("381", "YES")!.avgEntry).toBeCloseTo(0.78);
+  });
+});

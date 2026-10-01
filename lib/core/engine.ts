@@ -9,7 +9,7 @@ import type {
   SizingStrategyName,
   YesBook,
 } from "./types";
-import { bookStats, contractLevels, contractMid, round } from "./orderbook";
+import { availableQuantity, bookStats, contractLevels, contractMid, round } from "./orderbook";
 import { DEFAULT_FAIR_VALUE, estimateFairValue, type FairValueParams } from "./fairValue";
 import { DEFAULT_IMPACT, headlineImpact, type ImpactParams } from "./news";
 import { DEFAULT_EVAL, evaluateMarket, rankOpportunities, type EvalParams } from "./opportunity";
@@ -42,6 +42,14 @@ export interface StrategyConfig {
   reentryCooldownMinutes: number;
   /** never add to a regular position that is currently below entry at the executable exit */
   addOnlyWhenProfitable: boolean;
+  /**
+   * Snipe resting orders priced far from fair value: buy every ask (YES or NO side) priced at least
+   * `snipeEdge` below the contract's fair value, up to the risk caps, with that price as the limit.
+   * The regular exits (take profit / mean reversion) then sell it back.
+   */
+  snipe: boolean;
+  snipeEdge: number;
+  snipeMinConfidence: number;
   /** "auto" picks a sizing strategy per scenario using backtest-learned rules */
   sizing: SizingStrategyName | "auto";
   basedOn?: string | null;
@@ -65,6 +73,9 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   minEdgeToSpread: 0,
   reentryCooldownMinutes: 30,
   addOnlyWhenProfitable: true,
+  snipe: true,
+  snipeEdge: 0.03,
+  snipeMinConfidence: 0.5,
   sizing: "auto",
 };
 
@@ -259,12 +270,12 @@ export function runPortfolioTick(args: {
   };
 
   let newTrades = 0;
-  const execute = (o: Opportunity, scenario: string, fairSd: number) => {
+  const execute = (o: Opportunity, scenario: string, fairSd: number, opt: { notional?: number; limit?: number } = {}) => {
     if (newTrades >= cfg.maxNewTradesPerTick && !o.closesPosition) return;
     if (entryBlock(o)) return;
     const strategy = args.sizingMode === "auto" ? selectStrategy(scenario, args.rules) : args.sizingMode;
     const view = pfView();
-    let notional = rawNotional(strategy, o, view.equity, fairSd, cfg.risk);
+    let notional = opt.notional ?? rawNotional(strategy, o, view.equity, fairSd, cfg.risk);
     if (o.opportunityType === "headline") notional *= cfg.risk.headlineMultiplier;
     const size = constrainSize(o, notional, view, cfg.risk);
     const d: Decision = {
@@ -289,6 +300,7 @@ export function runPortfolioTick(args: {
       action: o.action,
       quantity: size.quantity,
       orderType: "market",
+      limitPrice: opt.limit ?? null,
       tag: `${o.opportunityType}:${scenario}:${strategy}`,
       meta: {
         fair: contractFair,
@@ -486,6 +498,29 @@ export function runPortfolioTick(args: {
     const best = rankOpportunities(opps, cfg.minNetEdge, 0.25).filter((o) => !o.closesPosition)[0];
     args.tradedHeadlines.add(key);
     if (best) execute(best, "headline", (shifted.upperBound - shifted.lowerBound) / 3.92);
+  }
+
+  // 3b. Snipe mispriced resting orders: take exactly the depth priced >= snipeEdge through fair.
+  if (cfg.snipe) {
+    for (const m of state.markets) {
+      const f = signals.fair.get(m.id);
+      const book = exec.book(m.id);
+      if (!f || !book || f.confidence < cfg.snipeMinConfidence) continue;
+      for (const action of ["BUY_YES", "BUY_NO"] as Action[]) {
+        const fairC = action === "BUY_YES" ? f.fairProbability : 1 - f.fairProbability;
+        const limit = round(Math.floor((fairC - cfg.snipeEdge) / 0.005 + 1e-9) * 0.005, 4);
+        if (limit <= 0) continue;
+        const qty = availableQuantity(book, action, limit);
+        if (qty < cfg.risk.minQuantity) continue;
+        const o = evaluateMarket({ marketId: m.id, title: m.title, book, fair: f, holdings: portfolio.freeHoldings(m.id), params: { ...cfg.eval, probeQuantity: qty } })
+          .find((x) => x.action === action && !x.closesPosition);
+        if (!o || o.netEdge < cfg.snipeEdge) continue;
+        execute({ ...o, availableQuantity: qty, reason: `SNIPE ${qty} @ <= ${limit} (fair ${fairC.toFixed(3)}): ${o.reason}` }, "snipe", (f.upperBound - f.lowerBound) / 3.92, {
+          notional: qty * o.vwap,
+          limit,
+        });
+      }
+    }
   }
 
   // 4. Regular opportunities across the whole universe.
