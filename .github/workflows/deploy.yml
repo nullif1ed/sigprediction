@@ -17,11 +17,19 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Set up SSH key
+        env:
+          KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          HOST: ${{ secrets.DROPLET_HOST }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+          # Tolerate keys pasted from Windows (CRLF) or with stray surrounding whitespace.
+          printf '%s\n' "$KEY" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.DROPLET_HOST }}" >> ~/.ssh/known_hosts
+          if ! ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null 2>&1; then
+            echo "::error::DROPLET_SSH_KEY is not a valid private key. Paste the full output of 'cat ~/.ssh/github_deploy' (including the BEGIN/END lines) into the secret."
+            exit 1
+          fi
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
 
       - name: Pull, build and restart
         run: |
