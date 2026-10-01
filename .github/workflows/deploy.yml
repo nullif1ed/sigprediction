@@ -1,0 +1,38 @@
+name: Deploy to droplet
+
+# Every push to main pulls, rebuilds and restarts the bot on the DigitalOcean droplet.
+# Required repo secrets: DROPLET_HOST (droplet IP) and DROPLET_SSH_KEY (private deploy key).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-droplet
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DROPLET_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Pull, build and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_HOST }} 'bash -se' <<'EOF'
+          set -euo pipefail
+          cd ~/sigprediction
+          git fetch origin main
+          git reset --hard origin/main
+          npm ci
+          npm run build
+          pm2 restart sigprediction
+          pm2 save
+          echo "Deployed $(git rev-parse --short HEAD)"
+          EOF
