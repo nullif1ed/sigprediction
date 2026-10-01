@@ -7,7 +7,7 @@ import { computeSignals, DEFAULT_STRATEGY, type StrategyConfig } from "../core/e
 import { evaluateMarket, rankOpportunities } from "../core/opportunity";
 import { detectArbitrage } from "../core/arbitrage";
 import { headlineId, headlineImpact } from "../core/news";
-import { raceLabel } from "../core/races";
+import { raceId, raceLabel } from "../core/races";
 
 // Stateless live views (work on Vercel): every call is cached so page views cannot exhaust the
 // 100 reads/minute API budget.
@@ -185,8 +185,24 @@ export async function scanOpportunities(cfg: StrategyConfig = DEFAULT_STRATEGY, 
     if (b && f) final.push(...evaluateMarket({ marketId: id, title: m.title, book: b, fair: f, holdings: { YES: 0, NO: 0 }, params: cfg.eval }));
   }
   const ranked = rankOpportunities(final, cfg.minNetEdge, cfg.minConfidence);
+  // Screen arbitrage on top of book, then price every candidate set on real depth: the screening
+  // books carry placeholder sizes and must never be used to size a set.
+  const members = markets.filter((m) => m.race && screen.has(m.id));
+  const screenedArbs = detectArbitrage(members.map((m) => ({ marketId: m.id, race: m.race!, book: screen.get(m.id)! })));
+  const arbLegs = [...new Set(screenedArbs.flatMap((a) => a.legs.map((l) => l.marketId)))].filter((id) => !depth.has(id)).slice(0, 12);
+  await Promise.all(
+    arbLegs.map(async (id) => {
+      try {
+        const b = await getDepth(id);
+        if (b) depth.set(id, b);
+      } catch {
+        /* a leg without depth is simply not reported */
+      }
+    }),
+  );
+  const arbRaces = new Set(screenedArbs.map((a) => a.raceId));
   const arbitrage = detectArbitrage(
-    markets.filter((m) => m.race && screen.has(m.id)).map((m) => ({ marketId: m.id, race: m.race!, book: depth.get(m.id) ?? screen.get(m.id)! })),
+    members.filter((m) => arbRaces.has(raceId(m.race!)) && depth.has(m.id)).map((m) => ({ marketId: m.id, race: m.race!, book: depth.get(m.id)! })),
   );
   return {
     asOf: now.toISOString(),

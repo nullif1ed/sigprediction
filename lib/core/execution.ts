@@ -41,8 +41,13 @@ const newId = () => `paper-${Date.now().toString(36)}-${(++seq).toString(36)}`;
  */
 export class PaperExecutionClient implements ExecutionClient {
   private orders = new Map<string, PaperOrder>();
-  private books = new Map<string, YesBook>(); // possibly consumed copies
-  private bookVersion = new Map<string, string>();
+  private books = new Map<string, YesBook>(); // books net of our own simulated fills
+  /**
+   * Our fills never reach the real exchange, so a refreshed book still displays liquidity we
+   * already took. Track consumption per price level and keep it until the displayed quantity at
+   * that level changes (i.e. the real book moved). Prevents re-buying the same shares every poll.
+   */
+  private used = new Map<string, { shown: number; used: number }>();
   now: () => Date = () => new Date();
 
   constructor(
@@ -51,15 +56,37 @@ export class PaperExecutionClient implements ExecutionClient {
     private feePerShare = 0,
   ) {}
 
-  /** Feed a fresh book. Resets consumed liquidity when the exchange version changes. */
+  /** Feed a fresh book; liquidity we already consumed stays consumed while the level is unchanged. */
   updateBook(book: YesBook) {
-    const prev = this.bookVersion.get(book.marketId);
-    if (prev !== book.asOf || !this.books.has(book.marketId)) {
-      this.books.set(book.marketId, book);
-      this.bookVersion.set(book.marketId, book.asOf);
-    }
+    const adjust = (side: "bids" | "asks") =>
+      book[side]
+        .map((l) => {
+          const k = `${book.marketId}:${side}:${l.price}`;
+          const u = this.used.get(k);
+          if (!u) return l;
+          if (u.shown !== l.quantity) {
+            this.used.delete(k); // the real level changed: displayed size is fresh
+            return l;
+          }
+          return { ...l, quantity: Math.max(0, l.quantity - u.used) };
+        })
+        .filter((l) => l.quantity > 0);
+    this.books.set(book.marketId, { ...book, bids: adjust("bids"), asks: adjust("asks") });
     this.processResting(book.marketId);
     this.expire();
+  }
+
+  private recordUse(marketId: string, side: "bids" | "asks", before: YesBook, qty: number, original: Map<number, number>) {
+    let left = qty;
+    for (const l of before[side]) {
+      if (left <= 0) break;
+      const take = Math.min(left, l.quantity);
+      const k = `${marketId}:${side}:${l.price}`;
+      const u = this.used.get(k) ?? { shown: original.get(l.price) ?? l.quantity, used: 0 };
+      u.used += take;
+      this.used.set(k, u);
+      left -= take;
+    }
   }
 
   book(marketId: string): YesBook | undefined {
@@ -125,6 +152,10 @@ export class PaperExecutionClient implements ExecutionClient {
     o.status = o.filledQuantity >= o.requestedQuantity ? "filled" : "partially_filled";
     o.updatedAt = ts;
     if (ex.levelsUsed > 1) o.notes = `walked ${ex.levelsUsed} levels, slippage ${ex.slippage.toFixed(4)}`;
+    const side: "bids" | "asks" = o.action === "BUY_YES" || o.action === "SELL_NO" ? "asks" : "bids";
+    // Displayed (pre-consumption) sizes are the remaining size plus what we already used.
+    const shown = new Map(book[side].map((l) => [l.price, l.quantity + (this.used.get(`${o.marketId}:${side}:${l.price}`)?.used ?? 0)]));
+    this.recordUse(o.marketId, side, book, ex.filled, shown);
     this.books.set(o.marketId, consume(book, o.action, ex.filled));
     this.events.onFill?.(
       fillRecord({ orderId: o.orderId, marketId: o.marketId, action: o.action, quantity: ex.filled, price: ex.vwap, timestamp: ts, realizedPnl: round(realized, 4) }),

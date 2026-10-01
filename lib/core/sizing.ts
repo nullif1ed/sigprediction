@@ -11,6 +11,13 @@ export interface RiskConfig {
   maxDrawdown: number; // stop opening new risk beyond this drawdown
   minQuantity: number;
   headlineMultiplier: number; // size boost for time-sensitive headline trades
+  // Arbitrage sets lock in profit, so they get their own (larger) capital budget.
+  maxArbitragePct: number; // max total cost basis in arbitrage sets / equity
+  maxArbRacePct: number; // max arbitrage cost basis per race / equity
+  cashReservePct: number; // cash always kept free for exits and regular trades
+  minArbReturn: number; // min expected return on capital per funded tranche
+  allowConditionalArb: boolean; // buy-all-YES sets that fail if an unlisted party wins
+  minConvergence: number; // min P(listed party wins) for a conditional set
 }
 
 export const DEFAULT_RISK: RiskConfig = {
@@ -24,6 +31,12 @@ export const DEFAULT_RISK: RiskConfig = {
   maxDrawdown: 0.2,
   minQuantity: 10,
   headlineMultiplier: 1.5,
+  maxArbitragePct: 0.6,
+  maxArbRacePct: 0.25,
+  cashReservePct: 0.05,
+  minArbReturn: 0.005,
+  allowConditionalArb: false,
+  minConvergence: 0.97,
 };
 
 export interface PortfolioView {
