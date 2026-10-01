@@ -1,0 +1,50 @@
+// Runtime configuration from environment variables. Never hardcode credentials.
+
+function num(name: string, def: number): number {
+  const v = process.env[name];
+  const n = v === undefined || v === "" ? NaN : Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+export const config = {
+  sigApiKey: process.env.SIG_API_KEY ?? "",
+  sigApiBase: process.env.SIG_API_BASE ?? "https://sig.thesuper.market/api/v1",
+  sigSiteBase: process.env.SIG_SITE_BASE ?? "https://sig.thesuper.market",
+  tournamentSlug: process.env.SIG_TOURNAMENT_SLUG ?? "midterm-elections",
+
+  // Published per-key limits (API reference, "Rate limits & retries"): standard keys get
+  // 100 reads and 30 writes per minute; 429 responses carry Retry-After: 60.
+  readsPerMinute: num("SIG_READS_PER_MIN", 100),
+  writesPerMinute: num("SIG_WRITES_PER_MIN", 30),
+  rateSafety: num("SIG_RATE_SAFETY", 0.85),
+  requestTimeoutMs: num("SIG_TIMEOUT_MS", 10_000),
+
+  priceIntervalSec: num("PRICE_POLL_SEC", 5),
+  externalIntervalSec: num("EXTERNAL_POLL_SEC", 90),
+  newsMarketsPerMinute: num("NEWS_MARKETS_PER_MIN", 12),
+  marketsRefreshSec: num("MARKETS_REFRESH_SEC", 600),
+  snapshotHeartbeatSec: num("SNAPSHOT_HEARTBEAT_SEC", 60),
+
+  initialBankroll: num("INITIAL_BANKROLL", 100_000),
+  dbPath: process.env.DB_PATH ?? "./data/predictioncup.db",
+
+  /** Optional shared secret for mutating endpoints (start/stop/reset). */
+  adminToken: process.env.BOT_ADMIN_TOKEN ?? "",
+  /** Day-2: URL of the long-running bot backend that a Vercel UI proxies stateful calls to. */
+  backendUrl: (process.env.BOT_BACKEND_URL ?? "").replace(/\/$/, ""),
+  /** Reserved for future Polymarket CLOB features. Public price reads need no key. */
+  polymarketApiKey: process.env.POLYMARKET_API_KEY ?? "",
+  /** Reserved: Kalshi authenticated calls need this key ID plus an RSA private key. Market data is public. */
+  kalshiApiKeyId: process.env.KALSHI_API_KEY_ID ?? "",
+};
+
+/**
+ * Collection, paper trading and backtests need a long-running process and a writable disk.
+ * Vercel functions have neither, so on Vercel these features are proxied to BOT_BACKEND_URL
+ * (or reported unavailable). Set ENABLE_STATEFUL=1 to force them on.
+ */
+export function statefulMode(): "local" | "proxy" | "unavailable" {
+  if (process.env.ENABLE_STATEFUL === "1") return "local";
+  if (process.env.VERCEL) return config.backendUrl ? "proxy" : "unavailable";
+  return "local";
+}
