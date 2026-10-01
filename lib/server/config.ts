@@ -37,6 +37,10 @@ export const config = {
 
   /** Optional shared secret for mutating endpoints (start/stop/reset). */
   adminToken: process.env.BOT_ADMIN_TOKEN ?? "",
+  /** Read-only token for GET /api/export/db (database download for offline backtests). Empty disables it. */
+  get exportToken() {
+    return process.env.BOT_EXPORT_TOKEN ?? "";
+  },
   /** Day-2: URL of the long-running bot backend that a Vercel UI proxies stateful calls to. */
   backendUrl: (process.env.BOT_BACKEND_URL ?? "").replace(/\/$/, ""),
   /** Reserved for future Polymarket CLOB features. Public price reads need no key. */
