@@ -16,8 +16,9 @@ export const config = {
   // 100 reads and 30 writes per minute; 429 responses carry Retry-After: 60.
   readsPerMinute: num("SIG_READS_PER_MIN", 100),
   writesPerMinute: num("SIG_WRITES_PER_MIN", 30),
-  rateSafety: num("SIG_RATE_SAFETY", 0.85),
-  requestTimeoutMs: num("SIG_TIMEOUT_MS", 8_000),
+  // The budget is per account and shared with the dashboard / Vercel UI / live trader.
+  rateSafety: num("SIG_RATE_SAFETY", 0.75),
+  requestTimeoutMs: num("SIG_TIMEOUT_MS", 12_000),
 
   /** fast loop: top of book for the "hot" markets (positions, arbitrage races, live signals) */
   priceIntervalSec: num("PRICE_POLL_SEC", 2),

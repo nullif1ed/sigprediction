@@ -5,8 +5,9 @@ import type { Level, SigMarket, YesBook } from "../core/types";
 import { normalizeBook } from "../core/orderbook";
 import { parseSigTitle } from "../core/races";
 
-// Read-only client for the Super Market API (https://sig.thesuper.market/api/v1/docs).
-// There are intentionally no order-placement methods: execution in this project is paper only.
+// Client for the Super Market API (https://sig.thesuper.market/api/v1/docs).
+// Reads use the read budget; order placement/cancel use a separate write budget. The order
+// methods are not called anywhere yet: execution is still paper only.
 
 export class SigApiError extends Error {
   constructor(
@@ -55,6 +56,45 @@ export interface RawNews {
   lastRefresh: string | null;
 }
 
+export interface OrderInput {
+  exchangeId: string;
+  side: "yes" | "no";
+  action: "buy" | "sell";
+  quantity: number;
+  /** limit in side-relative terms on the 0.005 tick; omit for a market order */
+  price?: number;
+  tournamentId?: string;
+}
+
+export interface OrderResult {
+  orderId: number | null;
+  exchangeId: string;
+  open: boolean;
+  remainingQuantity?: number;
+  action?: "buy" | "sell";
+  side?: "yes" | "no";
+  price?: number;
+  quantity?: number;
+  terminalReasonCode?: string | null;
+  quantityTraded: number;
+  totalCost: number;
+  fillPrice: number | null;
+}
+
+export interface TournamentPosition {
+  exchangeId: string;
+  marketId: string;
+  marketTitle: string;
+  settled: boolean;
+  /** positive = YES shares, negative = NO shares */
+  quantity: number;
+  avgCost: number;
+  currentPrice: number | null;
+  marketValue: number;
+  costBasis: number;
+  lots: { lotId: string; side: string; quantity: number; entryPrice: number; openedAt: string }[];
+}
+
 export interface Tournament {
   id: string;
   slug: string;
@@ -83,6 +123,8 @@ export class SigClient {
   readonly reads: RateLimiter;
   /** Site endpoints (news) are unauthenticated and outside the API key budget; keep them gentle. */
   readonly site: RateLimiter;
+  /** Order placement / cancellation budget (30 writes per minute per account, with safety). */
+  readonly writes: RateLimiter;
   private apiKey: string;
   private base: string;
   private siteBase: string;
@@ -102,6 +144,7 @@ export class SigClient {
     this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.reads = new RateLimiter(Math.floor((o.readsPerMinute ?? config.readsPerMinute) * config.rateSafety), undefined, this.sleep);
     this.site = new RateLimiter(30, undefined, this.sleep);
+    this.writes = new RateLimiter(Math.floor(config.writesPerMinute * 0.7), undefined, this.sleep);
     this.timeoutMs = o.timeoutMs ?? config.requestTimeoutMs;
     this.maxRetries = o.maxRetries ?? 3;
   }
@@ -114,7 +157,10 @@ export class SigClient {
     this.closed = true;
   }
 
-  private async request<T>(url: string, opts: { auth: boolean; limiter: RateLimiter; timeoutMs?: number; maxRetries?: number }): Promise<T> {
+  private async request<T>(
+    url: string,
+    opts: { auth: boolean; limiter: RateLimiter; timeoutMs?: number; maxRetries?: number; method?: string; body?: unknown },
+  ): Promise<T> {
     if (opts.auth && !this.apiKey) throw new SigApiError(401, "MISSING_API_KEY", "SIG_API_KEY is not configured");
     const timeoutMs = opts.timeoutMs ?? this.timeoutMs;
     const maxRetries = opts.maxRetries ?? this.maxRetries;
@@ -127,7 +173,13 @@ export class SigClient {
       const started = Date.now();
       try {
         const res = await this.fetchFn(url, {
-          headers: { Accept: "application/json", ...(opts.auth ? { Authorization: `Bearer ${this.apiKey}` } : {}) },
+          method: opts.method ?? "GET",
+          headers: {
+            Accept: "application/json",
+            ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
+            ...(opts.auth ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+          },
+          body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
           signal: ctrl.signal,
           cache: "no-store",
         });
@@ -144,6 +196,7 @@ export class SigClient {
           this.rateLimited++;
           const ra = Number(res.headers.get("retry-after") ?? "60");
           opts.limiter.pause((Number.isFinite(ra) ? ra : 60) * 1000);
+          opts.limiter.throttle();
           log("WARNING", "sig_api", "rate_limited", { url: redact(url), retryAfterSec: ra });
           if (attempt++ < maxRetries) continue;
         }
@@ -180,6 +233,37 @@ export class SigClient {
     return this.request<T>(`${this.base}${path}`, { auth: true, limiter: this.reads, ...o });
   }
 
+  /** Writes retry with the SAME idempotency key (inside `body`), so a retry can never double-place. */
+  private write<T>(path: string, method: string, body?: unknown) {
+    return this.request<T>(`${this.base}${path}`, { auth: true, limiter: this.writes, method, body, timeoutMs: Math.max(this.timeoutMs, 20_000), maxRetries: 3 });
+  }
+
+  placeOrder(o: OrderInput & { idempotencyKey: string }) {
+    return this.write<OrderResult>("/orders", "POST", o);
+  }
+
+  placeMultiLeg(legs: OrderInput[], idempotencyKey: string) {
+    return this.write<{ results: { index: number; data: OrderResult }[] }>("/orders/multi-leg", "POST", { legs, idempotencyKey });
+  }
+
+  cancelOrder(orderId: number | string) {
+    return this.write<{ orderId: number; message: string }>(`/orders/${encodeURIComponent(String(orderId))}`, "DELETE");
+  }
+
+  tournamentPositions(slug = config.tournamentSlug) {
+    return this.api<{ positions: TournamentPosition[]; summary: { totalMarketValue: number; totalCostBasis: number } }>(
+      `/tournaments/${encodeURIComponent(slug)}/portfolio/positions`,
+      { timeoutMs: Math.max(this.timeoutMs, 15_000), maxRetries: 2 },
+    );
+  }
+
+  tournamentPnl(slug = config.tournamentSlug) {
+    return this.api<{ totalAccountValue: number; totalHoldingsValue: number; totalCostBasis: number; unrealizedPnl: number; roi: number | null }>(
+      `/tournaments/${encodeURIComponent(slug)}/portfolio/pnl?period=all`,
+      { timeoutMs: Math.max(this.timeoutMs, 15_000), maxRetries: 2 },
+    );
+  }
+
   account() {
     return this.api<{ id: string; username: string; balance: number }>("/account");
   }
@@ -209,7 +293,7 @@ export class SigClient {
     for (let i = 0; i < exchangeIds.length; i += 100) {
       const q = new URLSearchParams({ ids: exchangeIds.slice(i, i + 100).join(",") });
       if (tournamentId) q.set("tournamentId", tournamentId);
-      const r = await this.api<{ data: PriceSnapshot[] }>(`/exchanges/prices?${q}`, { timeoutMs: Math.min(this.timeoutMs, 5000), maxRetries: 2 });
+      const r = await this.api<{ data: PriceSnapshot[] }>(`/exchanges/prices?${q}`, { timeoutMs: this.timeoutMs, maxRetries: 1 });
       out.push(...r.data);
     }
     return out;
@@ -224,7 +308,7 @@ export class SigClient {
     if (tournamentId) q.set("tournamentId", tournamentId);
     const r = await this.api<{
       exchanges: { exchangeId: string; asOf: { sequence: number; at: string } | null; bids: Level[]; asks: Level[] }[];
-    }>(`/markets/${encodeURIComponent(marketId)}/orderbook?${q}`, { timeoutMs: Math.min(this.timeoutMs, 4000), maxRetries: 0 });
+    }>(`/markets/${encodeURIComponent(marketId)}/orderbook?${q}`, { timeoutMs: Math.min(this.timeoutMs, 10_000), maxRetries: 0 });
     const ex = r.exchanges?.[0];
     if (!ex) return null;
     return normalizeBook({
@@ -291,22 +375,29 @@ export function toSigMarket(m: RawMarket): SigMarket {
   };
 }
 
-/** Top-of-book only book from a bulk price snapshot (quantities unknown). */
+/** Placeholder size for a touch whose price is known but size is not (never enough to trade on). */
+export const UNKNOWN_QTY = 1;
+
+/**
+ * Merge a bulk top-of-book price into the last known book. Prices from the feed are always kept
+ * (valuation and arbitrage hints need them); sizes are only trusted when the price is unchanged.
+ * A new touch gets a 1-share placeholder (below any minimum order) until depth is fetched, and
+ * deeper known levels behind the new touch are kept.
+ */
 export function bookFromPrice(p: PriceSnapshot, prev?: YesBook | null): YesBook {
-  const qtyAt = (side: Level[] | undefined, price: number | null) => {
-    const hit = side?.find((l) => Math.abs(l.price - (price ?? -1)) < 1e-9);
-    return hit?.quantity ?? 0;
-  };
-  // If the touch moved we do not know the size behind it; keep known size when price unchanged.
-  const bids = p.bestBid !== null ? [{ price: p.bestBid, quantity: qtyAt(prev?.bids, p.bestBid) }] : [];
-  const asks = p.bestAsk !== null ? [{ price: p.bestAsk, quantity: qtyAt(prev?.asks, p.bestAsk) }] : [];
-  const sameTop = prev && prev.bids[0]?.price === (p.bestBid ?? undefined) && prev.asks[0]?.price === (p.bestAsk ?? undefined);
+  const sameTop = prev && (prev.bids[0]?.price ?? null) === p.bestBid && (prev.asks[0]?.price ?? null) === p.bestAsk;
   if (sameTop && prev) return prev;
+  const side = (top: number | null, levels: Level[] | undefined, better: (a: number, b: number) => boolean): Level[] => {
+    if (top === null) return [];
+    const known = levels?.find((l) => Math.abs(l.price - top) < 1e-9);
+    const behind = (levels ?? []).filter((l) => better(top, l.price) && Math.abs(l.price - top) > 1e-9);
+    return [{ price: top, quantity: known?.quantity ?? UNKNOWN_QTY }, ...behind];
+  };
   return normalizeBook({
     exchangeId: p.exchangeId,
     marketId: p.marketId,
-    bids: bids.filter((l) => l.quantity > 0),
-    asks: asks.filter((l) => l.quantity > 0),
+    bids: side(p.bestBid, prev?.bids, (top, px) => px < top),
+    asks: side(p.bestAsk, prev?.asks, (top, px) => px > top),
     asOf: `price:${p.bestBid}:${p.bestAsk}`,
     topOnly: true,
   });
