@@ -35,6 +35,7 @@ interface Arb {
   guaranteedPayoutPerSet: number;
   profitPerSet: number;
   totalProfit: number;
+  returnOnCapital: number;
   conditional: boolean;
   note: string;
 }
@@ -133,7 +134,7 @@ export default function Opportunities() {
       <Card title="Arbitrage monitor">
         <p className="mb-2 text-xs text-slate-500">
           A single SIG market cannot show YES ask + NO ask &lt; 1 because its NO book is derived from the YES book. Mispricing can appear across mutually
-          exclusive markets in one race (e.g. Democratic vs Republican for the same seat): if their YES bids sum above 1, buying NO on each locks in a profit.
+          exclusive markets in one race (e.g. Democratic vs Republican for the same seat): if their YES bids sum above 1, buying NO on each locks in a profit. Each set is sized level by level while the marginal set stays profitable; paper trading spreads capital across all sets by return on locked capital.
         </p>
         {!data?.arbitrage.length ? (
           <p className="text-sm text-slate-500">No arbitrage sets right now.</p>
@@ -147,8 +148,9 @@ export default function Opportunities() {
                 <Th>Cost/set</Th>
                 <Th>Payout/set</Th>
                 <Th>Profit/set</Th>
-                <Th>Sets</Th>
-                <Th>Total</Th>
+                <Th>Return</Th>
+                <Th>Sets (depth)</Th>
+                <Th>Max profit</Th>
               </tr>
             </thead>
             <tbody>
@@ -168,6 +170,7 @@ export default function Opportunities() {
                   <Td>{fmt.p(a.costPerSet)}</Td>
                   <Td>{a.guaranteedPayoutPerSet}</Td>
                   <Td className="text-emerald-700">{fmt.p(a.profitPerSet)}</Td>
+                  <Td>{fmt.pct(a.returnOnCapital)}</Td>
                   <Td>{a.quantity}</Td>
                   <Td>{fmt.n(a.totalProfit, 2)}</Td>
                 </tr>

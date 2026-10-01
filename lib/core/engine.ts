@@ -8,11 +8,12 @@ import type {
   SizingStrategyName,
   YesBook,
 } from "./types";
-import { bookStats, contractMid, round, simulateExecution } from "./orderbook";
+import { bookStats, contractMid, round } from "./orderbook";
 import { DEFAULT_FAIR_VALUE, estimateFairValue, type FairValueParams } from "./fairValue";
 import { DEFAULT_IMPACT, headlineImpact, type ImpactParams } from "./news";
 import { DEFAULT_EVAL, evaluateMarket, rankOpportunities, type EvalParams } from "./opportunity";
-import { detectArbitrage, type ArbitrageOpportunity } from "./arbitrage";
+import { detectArbitrage, sizeSet, type ArbitrageOpportunity } from "./arbitrage";
+import { allocateArbitrage, type ArbCandidate } from "./arbAllocation";
 import { constrainSize, DEFAULT_RISK, rawNotional, scenarioOf, selectStrategy, type RiskConfig, type ScenarioRules } from "./sizing";
 import { DEFAULT_EXITS, shouldExit, type ExitConfig } from "./exits";
 import type { Portfolio } from "./portfolio";
@@ -266,55 +267,98 @@ export function runPortfolioTick(args: {
     });
   };
 
-  // 2. Arbitrage (riskless sets) first.
-  for (const a of signals.arbitrage) {
-    if (a.conditional) continue;
+  // 2. Arbitrage: allocate capital across ALL simultaneous sets by expected return on capital.
+  if (signals.arbitrage.length) {
     const view = pfView();
-    const cap = Math.min(view.cash, view.equity * cfg.risk.maxRacePct - view.raceExposure(a.legs[0].marketId));
-    const q = Math.min(a.quantity, Math.floor(cap / Math.max(0.01, a.costPerSet)));
-    if (q < cfg.risk.minQuantity) continue;
-    // Every leg must still be fillable at the detected size against the (possibly consumed) book.
-    const fillable = a.legs.every((l) => {
-      const b = exec.book(l.marketId);
-      return b ? simulateExecution(b, l.action, q).filled >= q : false;
+    const arbExposure = portfolio.positions().filter((p) => p.tradeType === "arbitrage").reduce((s, p) => s + p.lots.reduce((a, l) => a + l.quantity * l.price, 0), 0);
+    const raceArb = (race: string) =>
+      portfolio
+        .positions()
+        .filter((p) => p.tradeType === "arbitrage" && portfolio.raceOf(p.marketId) === race)
+        .reduce((s, p) => s + p.lots.reduce((a, l) => a + l.quantity * l.price, 0), 0);
+    const settleDays = (a: ArbitrageOpportunity) => {
+      const d = a.legs.map((l) => titles.get(l.marketId)).filter(Boolean).map((m) => daysTo(m!.settlementDate, state.now));
+      return d.length ? Math.max(1, Math.max(...d)) : 30;
+    };
+    const cands: ArbCandidate[] = [];
+    for (const a of signals.arbitrage) {
+      let convergence = 1;
+      if (a.conditional) {
+        if (!cfg.risk.allowConditionalArb) continue;
+        // P(one of the listed parties wins) from our own fair values.
+        convergence = Math.min(1, a.legs.reduce((s, l) => s + (signals.fair.get(l.marketId)?.fairProbability ?? 0), 0));
+        if (convergence < cfg.risk.minConvergence) continue;
+      }
+      cands.push({ arb: a, convergence, daysToSettlement: settleDays(a) });
+    }
+    const budget = Math.min(
+      view.cash - view.equity * cfg.risk.cashReservePct,
+      view.equity * cfg.risk.maxArbitragePct - arbExposure,
+    );
+    const allocations = allocateArbitrage(cands, {
+      budget,
+      raceCap: (race) => {
+        const legRace = signals.arbitrage.find((x) => x.raceId === race)?.legs[0]?.marketId;
+        return view.equity * cfg.risk.maxArbRacePct - (legRace ? raceArb(portfolio.raceOf(legRace)) : 0);
+      },
+      minQuantity: cfg.risk.minQuantity,
+      minReturn: cfg.risk.minArbReturn,
     });
-    if (!fillable) continue;
-    for (const leg of a.legs) {
-      const d: Decision = {
-        marketId: leg.marketId,
-        title: titles.get(leg.marketId)?.title ?? leg.marketId,
-        action: leg.action,
-        contract: leg.action.endsWith("YES") ? "YES" : "NO",
-        opportunityType: "arbitrage",
-        executablePrice: leg.price,
-        vwap: leg.price,
-        bestPrice: leg.price,
-        fairValue: leg.price + a.profitPerSet / a.legs.length,
-        grossEdge: a.profitPerSet / a.legs.length,
-        spreadCost: 0,
-        slippage: 0,
-        transactionCosts: 0,
-        netEdge: a.profitPerSet / a.legs.length,
-        expectedReturn: a.profitPerSet / a.costPerSet,
-        confidence: 1,
-        availableQuantity: a.quantity,
-        evaluatedQuantity: q,
-        maxLossPerShare: 0,
-        riskAdjustedScore: round(100 * (a.profitPerSet / a.costPerSet), 3),
-        equivalentTo: [],
-        closesPosition: false,
-        reason: `${a.note} Race ${a.raceId}: cost ${a.costPerSet.toFixed(3)} per set, guaranteed payout ${a.guaranteedPayoutPerSet}, profit ${a.profitPerSet.toFixed(3)} per set.`,
-        quantity: q,
-        estimatedCost: round(q * leg.price, 2),
-        sizingStrategy: "fixed_fractional",
-        scenario: "arbitrage",
-        portfolioExposureAfter: view.equity ? round((view.grossExposure + q * a.costPerSet) / view.equity, 4) : 0,
-        timestamp: ts,
-      };
-      out.decisions.push(d);
-      args.onDecision?.(d);
-      const o = exec.submitOrder({ marketId: leg.marketId, action: leg.action, quantity: q, orderType: "market", tag: `arbitrage:arbitrage:${a.kind}`, meta: { tradeType: "arbitrage" } });
-      out.logs.push({ level: "INFO", message: `ARB ${a.kind} ${leg.action} ${o.filledQuantity}@${o.fillPrice}`, context: { marketId: leg.marketId, raceId: a.raceId } });
+    for (const al of allocations) {
+      const a = al.arb;
+      // Re-size against the books as they are now (earlier fills this tick may have consumed depth).
+      const live = sizeSet(
+        a.legs.map((l) => ({ marketId: l.marketId, action: l.action, book: exec.book(l.marketId)! })).filter((x) => x.book),
+        a.guaranteedPayoutPerSet,
+        al.quantity,
+      );
+      if (!live || live.legs.length !== a.legs.length || live.q < cfg.risk.minQuantity) {
+        out.logs.push({ level: "WARNING", message: `ARB ${a.raceId} skipped: depth gone before execution`, context: { raceId: a.raceId } });
+        continue;
+      }
+      const q = live.q;
+      const cps = live.cost / q;
+      for (const leg of live.legs) {
+        const d: Decision = {
+          marketId: leg.marketId,
+          title: titles.get(leg.marketId)?.title ?? leg.marketId,
+          action: leg.action,
+          contract: leg.action.endsWith("YES") ? "YES" : "NO",
+          opportunityType: "arbitrage",
+          executablePrice: leg.price,
+          vwap: leg.price,
+          bestPrice: leg.price,
+          fairValue: round(leg.price + (a.guaranteedPayoutPerSet * al.convergence - cps) / live.legs.length, 4),
+          grossEdge: round((a.guaranteedPayoutPerSet - cps) / live.legs.length, 4),
+          spreadCost: 0,
+          slippage: 0,
+          transactionCosts: 0,
+          netEdge: round((a.guaranteedPayoutPerSet * al.convergence - cps) / live.legs.length, 4),
+          expectedReturn: al.expectedReturn,
+          confidence: al.convergence,
+          availableQuantity: a.quantity,
+          evaluatedQuantity: q,
+          maxLossPerShare: a.conditional ? leg.price : 0,
+          riskAdjustedScore: round(100 * al.annualizedReturn, 3),
+          equivalentTo: [],
+          closesPosition: false,
+          reason:
+            `${a.note} Race ${a.raceId}: ${q} sets at ${cps.toFixed(4)} each, payout ${a.guaranteedPayoutPerSet}` +
+            `${a.conditional ? ` x P(listed wins) ${al.convergence.toFixed(3)}` : ""}; expected profit ${al.expectedProfit.toFixed(2)} ` +
+            `(${(al.expectedReturn * 100).toFixed(2)}% on ${al.cost.toFixed(0)} locked, ${(al.annualizedReturn * 100).toFixed(1)}% annualised); size limited by ${al.limitedBy}.`,
+          quantity: q,
+          estimatedCost: round(q * leg.price, 2),
+          sizingStrategy: "fixed_fractional",
+          scenario: "arbitrage",
+          portfolioExposureAfter: view.equity ? round((view.grossExposure + live.cost) / view.equity, 4) : 0,
+          timestamp: ts,
+        };
+        out.decisions.push(d);
+        args.onDecision?.(d);
+        const o = exec.submitOrder({ marketId: leg.marketId, action: leg.action, quantity: q, orderType: "market", tag: `arbitrage:arbitrage:${a.kind}`, meta: { tradeType: "arbitrage" } });
+        if (o.filledQuantity < q) out.logs.push({ level: "WARNING", message: `ARB leg ${leg.action} #${leg.marketId} filled ${o.filledQuantity}/${q}`, context: { raceId: a.raceId } });
+        out.logs.push({ level: "INFO", message: `ARB ${a.kind} ${leg.action} ${o.filledQuantity}@${o.fillPrice}`, context: { marketId: leg.marketId, raceId: a.raceId } });
+      }
     }
   }
 

@@ -1,6 +1,6 @@
 import type { Action, RaceKey, YesBook } from "./types";
 import { raceId } from "./races";
-import { round, simulateExecution } from "./orderbook";
+import { contractLevels, round } from "./orderbook";
 
 // On SIG every market is one YES exchange and the NO book is derived from it, so a single market
 // can never show YES ask + NO ask < 1 (that sum is always 1 + spread). Real mispricing shows up:
@@ -24,6 +24,10 @@ export interface ArbitrageOpportunity {
   guaranteedPayoutPerSet: number;
   profitPerSet: number;
   totalProfit: number;
+  /** profit per set / cost per set (capital is locked until settlement) */
+  returnOnCapital: number;
+  /** profitable depth ladder; the allocator spends capital tranche by tranche */
+  tranches: Tranche[];
   /** buy_all_yes only pays if one of the listed parties wins; third-party risk remains */
   conditional: boolean;
   note: string;
@@ -35,33 +39,65 @@ interface Member {
   book: YesBook;
 }
 
-function bestSet(members: Member[], action: Action, payoutFn: (n: number) => number, maxQty: number) {
-  // Grow the set size while every additional share keeps a positive guaranteed profit.
-  let best: { q: number; cost: number; legs: ArbLeg[] } | null = null;
-  const step = 10;
-  for (let q = step; q <= maxQty; q += step) {
-    const legs: ArbLeg[] = [];
-    let cost = 0;
-    let ok = true;
-    for (const m of members) {
-      const ex = simulateExecution(m.book, action, q);
-      if (ex.filled < q || ex.vwap === null) {
-        ok = false;
-        break;
-      }
-      legs.push({ marketId: m.marketId, action, price: ex.vwap, quantity: q });
-      cost += ex.vwap;
+export interface Tranche {
+  quantity: number; // sets available at this price step
+  costPerSet: number; // marginal cost of one set at this step (sum of leg level prices)
+}
+
+export interface SetSize {
+  q: number;
+  cost: number; // total cost of q sets
+  legs: ArbLeg[];
+  /** depth ladder of profitable sets, best (cheapest) first */
+  tranches: Tranche[];
+}
+
+/**
+ * Largest profitable set size: walks every leg's book level by level and adds sets only while the
+ * MARGINAL set (sum of the current level prices) still pays out more than it costs by at least
+ * `minMarginal`. Stopping on marginal rather than average cost maximises total profit: deeper
+ * levels that would lose money on their own are never bought. `maxQty` caps the walk.
+ */
+export function sizeSet(
+  legs: { marketId: string; action: Action; book: YesBook }[],
+  payout: number,
+  maxQty = Number.MAX_SAFE_INTEGER,
+  minMarginal = 0.001,
+): SetSize | null {
+  const ladders = legs.map((l) => contractLevels(l.book, l.action).map((x) => ({ ...x })));
+  if (!ladders.length || ladders.some((x) => !x.length)) return null;
+  const idx = ladders.map(() => 0);
+  const notional = ladders.map(() => 0);
+  const tranches: Tranche[] = [];
+  let q = 0;
+  for (;;) {
+    if (idx.some((i, k) => i >= ladders[k].length)) break;
+    const marginal = ladders.reduce((s, lv, k) => s + lv[idx[k]].price, 0);
+    if (payout - marginal < minMarginal - 1e-12) break;
+    const chunk = Math.min(maxQty - q, ...ladders.map((lv, k) => lv[idx[k]].quantity));
+    if (chunk <= 0) break;
+    for (let k = 0; k < ladders.length; k++) {
+      const lv = ladders[k][idx[k]];
+      notional[k] += chunk * lv.price;
+      lv.quantity -= chunk;
+      if (lv.quantity <= 0) idx[k]++;
     }
-    if (!ok) break;
-    if (payoutFn(members.length) - cost <= 1e-9) break;
-    best = { q, cost, legs };
+    q += chunk;
+    tranches.push({ quantity: chunk, costPerSet: round(marginal) });
+    if (q >= maxQty) break;
   }
-  return best;
+  if (q <= 0) return null;
+  return {
+    tranches,
+    q,
+    cost: notional.reduce((a, b) => a + b, 0),
+    legs: legs.map((l, k) => ({ marketId: l.marketId, action: l.action, price: round(notional[k] / q), quantity: q })),
+  };
 }
 
 export function detectArbitrage(markets: Member[], opts: { minProfitPerSet?: number; maxQty?: number } = {}): ArbitrageOpportunity[] {
   const minProfit = opts.minProfitPerSet ?? 0.005;
-  const maxQty = opts.maxQty ?? 5000;
+  const maxQty = opts.maxQty ?? Number.MAX_SAFE_INTEGER;
   const out: ArbitrageOpportunity[] = [];
 
   for (const m of markets) {
@@ -76,11 +112,13 @@ export function detectArbitrage(markets: Member[], opts: { minProfitPerSet?: num
           { marketId: m.marketId, action: "BUY_YES", price: ask, quantity: q },
           { marketId: m.marketId, action: "SELL_YES", price: bid, quantity: q },
         ],
+        tranches: [{ quantity: q, costPerSet: ask }],
         quantity: q,
         costPerSet: ask,
         guaranteedPayoutPerSet: bid,
         profitPerSet: round(bid - ask),
         totalProfit: round((bid - ask) * q, 2),
+        returnOnCapital: round((bid - ask) / ask, 5),
         conditional: false,
         note: "Crossed book on a single exchange (bid above ask).",
       });
@@ -97,42 +135,49 @@ export function detectArbitrage(markets: Member[], opts: { minProfitPerSet?: num
     if (members.length < 2 || parties.size !== members.length) continue;
 
     // Buy NO on every listed party: at most one of them wins, so n-1 NO shares always pay out.
-    const noSet = bestSet(members, "BUY_NO", (n) => n - 1, maxQty);
+    const payoutNo = members.length - 1;
+    const noSet = sizeSet(members.map((m) => ({ marketId: m.marketId, action: "BUY_NO" as Action, book: m.book })), payoutNo, maxQty);
     if (noSet) {
-      const payout = members.length - 1;
-      const profit = payout - noSet.cost;
+      const cps = noSet.cost / noSet.q;
+      const profit = payoutNo - cps;
       if (profit >= minProfit)
         out.push({
           kind: "buy_all_no",
           raceId: rid,
           legs: noSet.legs,
+          tranches: noSet.tranches,
           quantity: noSet.q,
-          costPerSet: round(noSet.cost),
-          guaranteedPayoutPerSet: payout,
+          costPerSet: round(cps),
+          guaranteedPayoutPerSet: payoutNo,
           profitPerSet: round(profit),
           totalProfit: round(profit * noSet.q, 2),
+          returnOnCapital: round(profit / cps, 5),
           conditional: false,
           note: "YES bids across mutually exclusive outcomes sum above 1: buying NO on each locks in profit.",
         });
     }
     // Buy YES on every listed party: pays 1 only if one of them wins (third-party risk).
-    const yesSet = bestSet(members, "BUY_YES", () => 1, maxQty);
+    const yesSet = sizeSet(members.map((m) => ({ marketId: m.marketId, action: "BUY_YES" as Action, book: m.book })), 1, maxQty);
     if (yesSet) {
-      const profit = 1 - yesSet.cost;
+      const cps = yesSet.cost / yesSet.q;
+      const profit = 1 - cps;
       if (profit >= minProfit)
         out.push({
           kind: "buy_all_yes",
           raceId: rid,
           legs: yesSet.legs,
+          tranches: yesSet.tranches,
           quantity: yesSet.q,
-          costPerSet: round(yesSet.cost),
+          costPerSet: round(cps),
           guaranteedPayoutPerSet: 1,
           profitPerSet: round(profit),
           totalProfit: round(profit * yesSet.q, 2),
+          returnOnCapital: round(profit / cps, 5),
           conditional: !parties.has("I"),
           note: "YES asks across outcomes sum below 1. Pays only if a listed party wins.",
         });
     }
   }
-  return out.sort((a, b) => b.totalProfit - a.totalProfit);
+  // Capital is the binding constraint, so rank by return on capital, then absolute profit.
+  return out.sort((a, b) => b.returnOnCapital - a.returnOnCapital || b.totalProfit - a.totalProfit);
 }

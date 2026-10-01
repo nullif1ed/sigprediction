@@ -27,15 +27,18 @@ describe("paper execution engine", () => {
     for (const k of ["orderId", "marketId", "action", "contract", "requestedQuantity", "filledQuantity", "fillPrice", "fees", "createdAt", "status"]) expect(o).toHaveProperty(k);
   });
 
-  it("does not reuse liquidity it already consumed until the book changes", () => {
+  it("does not re-buy displayed liquidity it already took until the real level changes", () => {
     const { ex } = setup();
-    const b = book("1", [[0.4, 100]], [[0.5, 100]], "v1");
-    ex.updateBook(b);
+    ex.updateBook(book("1", [[0.4, 100]], [[0.5, 100], [0.6, 50]], "v1"));
     expect(ex.submitOrder({ marketId: "1", action: "BUY_YES", quantity: 100, orderType: "market" }).filledQuantity).toBe(100);
-    ex.updateBook(b); // same version
-    expect(ex.submitOrder({ marketId: "1", action: "BUY_YES", quantity: 100, orderType: "market" }).status).toBe("cancelled");
-    ex.updateBook(book("1", [[0.4, 100]], [[0.5, 100]], "v2"));
-    expect(ex.submitOrder({ marketId: "1", action: "BUY_YES", quantity: 100, orderType: "market" }).filledQuantity).toBe(100);
+    // A refreshed book (new version) still shows our 100 at 0.50 because paper fills never hit SIG.
+    ex.updateBook(book("1", [[0.4, 100]], [[0.5, 100], [0.6, 50]], "v2"));
+    const o = ex.submitOrder({ marketId: "1", action: "BUY_YES", quantity: 100, orderType: "market" });
+    expect(o.filledQuantity).toBe(50);
+    expect(o.fillPrice).toBe(0.6);
+    // The real 0.50 level changed size: it is fresh liquidity again.
+    ex.updateBook(book("1", [[0.4, 100]], [[0.5, 300]], "v3"));
+    expect(ex.submitOrder({ marketId: "1", action: "BUY_YES", quantity: 300, orderType: "market" }).filledQuantity).toBe(300);
   });
 
   it("rests limit orders, fills them when the book trades through, and expires them", () => {
