@@ -287,8 +287,9 @@ export function valuePosition(p: Position, book?: YesBook) {
   const cb = costBasis(p);
   if (!book) return { mid: cb, liquidation: cb, markPrice: p.avgEntry, exitPrice: null as number | null };
   const s = bookStats(book);
-  const yesMid = s.mid ?? s.bestBid ?? s.bestAsk ?? p.avgEntry;
-  const markPrice = p.contract === "YES" ? yesMid : 1 - yesMid;
+  const yesMid = s.mid ?? s.bestBid ?? s.bestAsk;
+  // No price at all: hold at cost (avgEntry is already in the held contract's terms).
+  const markPrice = yesMid === null ? p.avgEntry : p.contract === "YES" ? yesMid : 1 - yesMid;
   // Exit: YES holder hits YES bid; NO holder sells NO = lifts YES ask -> receives 1 - ask.
   const exitPrice = p.contract === "YES" ? s.bestBid : s.bestAsk !== null ? 1 - s.bestAsk : null;
   return {

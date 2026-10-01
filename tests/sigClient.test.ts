@@ -68,8 +68,11 @@ describe("SIG API client", () => {
     expect(bookFromPrice(p, prev)).toBe(prev);
     const moved = bookFromPrice({ ...p, bestAsk: 0.9 }, prev);
     expect(moved.topOnly).toBe(true);
-    expect(moved.asks).toHaveLength(0); // unknown size behind a new price: never assume liquidity
+    // The new price is kept (valuation needs it) with a 1-share placeholder: never assume liquidity.
+    expect(moved.asks).toEqual([{ price: 0.9, quantity: 1 }, { price: 0.905, quantity: 1000 }]);
     expect(moved.bids[0].quantity).toBe(1000);
+    // Bids vanished in the feed: the side is empty, not stale.
+    expect(bookFromPrice({ ...p, bestBid: null }, prev).bids).toHaveLength(0);
   });
 
   it("maps raw markets to normalised markets", () => {

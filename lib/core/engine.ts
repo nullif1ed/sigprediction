@@ -55,7 +55,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   risk: DEFAULT_RISK,
   exits: DEFAULT_EXITS,
   impact: DEFAULT_IMPACT,
-  minNetEdge: 0.01,
+  minNetEdge: 0.015,
   minConfidence: 0.4,
   headlineTrading: true,
   headlineWindowMinutes: 120,

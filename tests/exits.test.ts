@@ -86,3 +86,16 @@ describe("arbitrage unwind sizing", () => {
     expect(sizeUnwind(legs, 1.01)).toBeNull();
   });
 });
+
+describe("mean-reversion exit", () => {
+  it("exits at about entry once the mispricing has closed, instead of waiting for the target", () => {
+    const p = pos({ avgEntry: 0.9, lots: [{ quantity: 100, price: 0.9 }], entryLiquidationValue: 0.89 });
+    const cfg = { ...DEFAULT_EXITS, takeProfitPp: 0.05, profitTarget: 1, breakevenArmPp: 1 };
+    // Fair 0.90, mid 0.90: no edge left; bid 0.895 is within the 0.5pp scratch allowance.
+    const r = shouldExit({ position: p, book: book("1", [[0.895, 500]], [[0.905, 500]]), contractFair: 0.9, daysToResolution: 30, now, cfg });
+    expect(r.reason).toBe("mean_reverted");
+    expect(r.limitPrice).toBeCloseTo(0.895);
+    // Edge still open (fair 0.95): hold.
+    expect(shouldExit({ position: p, book: book("1", [[0.895, 500]], [[0.905, 500]]), contractFair: 0.95, daysToResolution: 30, now, cfg }).exit).toBe(false);
+  });
+});

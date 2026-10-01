@@ -9,6 +9,13 @@ export class RateLimiter {
   private stamps: number[] = [];
   private pausedUntil = 0;
   used = 0;
+  /**
+   * Adaptive share of `capacity` actually used. The budget is per ACCOUNT, shared with every
+   * other client of the same key (dashboard, Vercel UI, the live trader), so after a 429 we
+   * throttle down and only creep back up after a quiet period.
+   */
+  private scale = 1;
+  private lastThrottle = 0;
 
   constructor(
     perMinute: number,
@@ -24,11 +31,27 @@ export class RateLimiter {
     while (this.stamps.length && this.stamps[0] <= cutoff) this.stamps.shift();
   }
 
+  /** Current effective per-minute limit. */
+  get limit(): number {
+    const quietMin = (this.now() - this.lastThrottle) / 60_000;
+    if (this.scale < 1 && quietMin >= 2) {
+      this.scale = Math.min(1, this.scale + 0.05 * Math.floor(quietMin / 2));
+      this.lastThrottle = this.now() - (quietMin % 2) * 60_000;
+    }
+    return Math.max(1, Math.floor(this.capacity * this.scale));
+  }
+
+  /** Called on a 429: cut the effective budget by 20% (floor 50%). */
+  throttle() {
+    this.scale = Math.max(0.5, this.scale * 0.8);
+    this.lastThrottle = this.now();
+  }
+
   /** Requests still allowed in the current window. */
   available(): number {
     if (this.now() < this.pausedUntil) return 0;
     this.prune();
-    return this.capacity - this.stamps.length;
+    return this.limit - this.stamps.length;
   }
 
   usedLastMinute(): number {

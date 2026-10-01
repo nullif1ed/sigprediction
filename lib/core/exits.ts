@@ -32,6 +32,18 @@ export interface ExitConfig {
   exitOnIlliquid: boolean;
   /** max probability points an exit may walk below the touch (limit-price protection) */
   maxExitSlippagePp: number;
+  /**
+   * Mean reversion: the trade exists because SIG was mispriced vs our fair value. Once the gap at
+   * the mid has closed to <= this (pp), there is no reason to hold: sell at about entry or better
+   * instead of waiting for a take-profit that may never come.
+   */
+  revertedEdgePp: number;
+  /** a mean-reversion / time exit may sell down to entry - this (a scratch, not a loss) */
+  revertSlackPp: number;
+  /** fair value has moved this far below the mid: the signal flipped, get out (limit-protected) */
+  flipEdgePp: number;
+  /** after this many minutes without a target, exit at about entry (0 disables) */
+  maxHoldMinutes: number;
 }
 
 // Tuned on the 1 Oct 2026 collected data (walk-forward, see PR notes).
@@ -49,6 +61,10 @@ export const DEFAULT_EXITS: ExitConfig = {
   headlineMaxAgeMinutes: 60,
   exitOnIlliquid: false,
   maxExitSlippagePp: 0.02,
+  revertedEdgePp: 0,
+  revertSlackPp: 0.005,
+  flipEdgePp: 0.015,
+  maxHoldMinutes: 0,
 };
 
 export interface ExitDecision {
@@ -125,9 +141,30 @@ export function shouldExit(args: {
     if (s.qty > 0) return { exit: true, reason: "fair_value_reached", exitPrice: best, limitPrice: floor(lim), quantity: s.qty };
   }
 
+  // 2b. Mean reversion / signal flip / time exit, all measured on the contract mid.
+  const mark = v.markPrice;
+  if (args.contractFair !== null) {
+    const edgeNow = args.contractFair - mark;
+    if (edgeNow <= cfg.revertedEdgePp && edgeNow > -cfg.flipEdgePp) {
+      const lim = floor(entry - cfg.revertSlackPp);
+      const s = sellableAt(args.book, p, qty, lim);
+      if (s.qty > 0) return { exit: true, reason: "mean_reverted", exitPrice: best, limitPrice: lim, quantity: s.qty };
+    }
+    if (edgeNow <= -cfg.flipEdgePp && !(best < args.contractFair - cfg.dislocationPp)) {
+      const lim = floor(best - cfg.maxExitSlippagePp);
+      const s = sellableAt(args.book, p, qty, lim);
+      if (s.qty > 0) return { exit: true, reason: "signal_flipped", exitPrice: best, limitPrice: lim, quantity: s.qty };
+    }
+  }
+  if (cfg.maxHoldMinutes > 0 && (args.now.getTime() - Date.parse(p.openedAt)) / 60000 >= cfg.maxHoldMinutes) {
+    const lim = floor(entry - cfg.revertSlackPp);
+    const s = sellableAt(args.book, p, qty, lim);
+    if (s.qty > 0) return { exit: true, reason: "time_exit", exitPrice: best, limitPrice: lim, quantity: s.qty };
+  }
+
   // 3. Breakeven: once real profit was executable, never let the position turn into a loss
   // without trying to get out flat. Only sells at (about) entry; otherwise the normal stop applies.
-  const markPrice = v.markPrice;
+  const markPrice = mark;
   const armed = (p.peakProfitPp ?? -Infinity) >= cfg.breakevenArmPp;
   if (armed && markPrice <= entry + 1e-9) {
     const lim = floor(entry - cfg.breakevenSlackPp);

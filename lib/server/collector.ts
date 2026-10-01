@@ -102,7 +102,7 @@ export class Collector {
       strategy: this.strategy.name,
       lastError: this.lastError,
       readsLastMinute: this.client.reads.usedLastMinute(),
-      readBudgetPerMinute: this.client.reads.capacity,
+      readBudgetPerMinute: this.client.reads.limit,
       rateLimited: this.client.rateLimited,
       priceIntervalSec: config.priceIntervalSec,
       headlinesSeen: [...this.headlines.values()].reduce((s, h) => s + h.length, 0),
