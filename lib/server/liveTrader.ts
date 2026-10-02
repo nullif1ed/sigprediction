@@ -167,20 +167,19 @@ export class LiveTrader {
           groups.set(k, [...(groups.get(k) ?? []), p]);
         }
         const ordered = [...groups.values()].sort((a, b) => Number(!a.some((x) => isExit(x.o))) - Number(!b.some((x) => isExit(x.o))));
-        let anyOpen = false;
         for (const g of ordered) {
           const exit = g.some((x) => isExit(x.o));
           if (!exit && (this.stats.halted || Date.now() - g[0].queuedAt > config.liveMaxOrderAgeSec * 1000 || this.client.writes.available() <= 1)) {
             this.stats.dropped += g.length;
             continue;
           }
-          anyOpen = (await this.send(g.map((x) => x.o))) || anyOpen;
-        }
-        if (anyOpen) {
-          try {
-            await this.client.cancelAll(this.tournamentId);
-          } catch (e) {
-            this.fail("cancel_all_failed", e);
+          // A resting remainder could fill later and unbalance a set: cancel it before the next group.
+          if (await this.send(g.map((x) => x.o))) {
+            try {
+              await this.client.cancelAll(this.tournamentId);
+            } catch (e) {
+              this.fail("cancel_all_failed", e);
+            }
           }
         }
       }

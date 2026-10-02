@@ -32,9 +32,11 @@ export interface RealtimeStats {
   lastBatchAt: string | null;
   resyncs: number;
   tokenExpiresAt: string | null;
+  lastStatus?: string;
 }
 
-const MARKETS_PER_CONNECTION = 80;
+// Smaller sockets keep heartbeats alive while the server is busy (80 per socket timed out).
+const MARKETS_PER_CONNECTION = 30;
 
 export class RealtimeBooks {
   private clients: SupabaseClient[] = [];
@@ -43,6 +45,7 @@ export class RealtimeBooks {
   private seq = new Map<string, number>();
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private subscribed = new Set<string>();
+  private statusCounts: Record<string, number> = {};
   stats: RealtimeStats = { connected: false, subscribed: 0, markets: 0, batches: 0, lastBatchAt: null, resyncs: 0, tokenExpiresAt: null };
   /** marketId -> epoch ms of the last realtime book */
   updatedAt = new Map<string, number>();
@@ -69,13 +72,18 @@ export class RealtimeBooks {
           .channel(`tournament:${tournamentId}:market:${m.id}`, { config: { private: true } })
           .on("broadcast", { event: "market_batch" }, ({ payload }) => this.onBatch(m.id, exchangeOf.get(m.id) ?? "", payload))
           .on("broadcast", { event: "book_dirty" }, () => this.resync(m.id))
-          .subscribe((status) => {
+          .subscribe((status, err) => {
             if (status === "SUBSCRIBED") {
               this.subscribed.add(m.id);
               // State before the subscription is unknown: always resync once.
               this.resync(m.id);
             } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-              this.subscribed.delete(m.id);
+              if (this.subscribed.delete(m.id) || status !== "CLOSED") {
+                this.stats.lastStatus = `${status}${err ? `: ${String(err.message ?? err)}` : ""}`.slice(0, 200);
+                this.statusCounts[status] = (this.statusCounts[status] ?? 0) + 1;
+                if (this.statusCounts[status] === 1 || this.statusCounts[status] % 50 === 0)
+                  log("WARNING", "realtime", "channel_status", { marketId: m.id, status, error: err ? String(err.message ?? err) : null, counts: this.statusCounts });
+              }
               this.lastRev.delete(m.id);
             }
             this.stats.subscribed = this.subscribed.size;
@@ -141,8 +149,10 @@ export class RealtimeBooks {
   }
 
   async stop() {
+    this.statusCounts = {};
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     this.refreshTimer = null;
+    this.subscribed.clear();
     for (const c of this.clients) await c.removeAllChannels().catch(() => undefined);
     this.clients = [];
     this.channels = [];

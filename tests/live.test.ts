@@ -49,11 +49,10 @@ const state = (books: Map<string, YesBook>): MarketState => ({ now: new Date("20
 function setup(fill: (leg: { exchangeId: string; quantity: number; price: number }) => number) {
   const sig = fakeSig(fill);
   const pf = new Portfolio(100_000);
-  let ex: PaperExecutionClient | null = null;
-  const live = new LiveTrader(sig.client, "t1", () => markets, () => pf, () => ex?.resetConsumption());
-  ex = new PaperExecutionClient(pf, { onOrder: (o: PaperOrder) => live.capture(o) });
+  const live = new LiveTrader(sig.client, "t1", () => markets, () => pf);
+  const ex = new PaperExecutionClient(pf, { onOrder: (o: PaperOrder) => live.capture(o) });
   const cfg = mergeStrategy({ name: "t" });
-  const tick = (books: Map<string, YesBook>) => runPortfolioTick({ state: state(books), signals: computeSignals(state(books), cfg), cfg, portfolio: pf, exec: ex!, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
+  const tick = (books: Map<string, YesBook>) => runPortfolioTick({ state: state(books), signals: computeSignals(state(books), cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
   return { ...sig, pf, live, tick };
 }
 
@@ -90,9 +89,10 @@ describe("live execution", () => {
     expect(t.calls.some((c) => c.path === "/orders/cancel-all")).toBe(true);
     expect(t.pf.arbQty("381", "NO")).toBe(500);
     expect(t.pf.arbQty("382", "NO")).toBe(200);
-    // Next tick: completing costs 0.40 + 0.55 = 0.95 < 1, so the short leg is bought, not dumped.
-    const r = t.tick(arbBooks());
-    expect(r.logs.some((l) => /ARB repair .* completed/.test(l.message))).toBe(true);
+    // Next tick (a NEWER book: the real fills changed the levels): completing costs 0.40 + 0.55 =
+    // 0.95 < 1, so the short leg is bought, not dumped.
+    const r = t.tick(new Map([["381", book("381", [[0.6, 9000]], [[0.62, 500]])], ["382", book("382", [[0.45, 8000]], [[0.47, 500]])]]));
+    expect(r.logs.some((l) => /ARB repair .* bought short legs/.test(l.message))).toBe(true);
   });
 
   it("never sells more than is really held (an unbacked sell would become a buy)", async () => {
@@ -152,6 +152,19 @@ describe("realtime books", () => {
   });
 });
 
+describe("no duplicate entries", () => {
+  it("does not re-buy a set while the book has not refreshed since our own fill", async () => {
+    const t = setup((l) => l.quantity);
+    await t.live.reconcile(true);
+    t.tick(arbBooks());
+    await t.live.flush();
+    t.tick(arbBooks()); // same (stale) book after the reconcile
+    await t.live.flush();
+    expect(t.calls.filter((c) => c.path === "/orders/multi-leg")).toHaveLength(1);
+    expect(t.pf.holdings("381").NO).toBe(500);
+  });
+});
+
 describe("reconcile", () => {
   it("recognises a complete set held on SIG as arbitrage even without local records", async () => {
     const t = setup((l) => l.quantity);
@@ -160,5 +173,28 @@ describe("reconcile", () => {
     await t.live.reconcile(true);
     expect(t.pf.arbQty("381", "NO")).toBe(300);
     expect(t.pf.arbSets.get("2026:SENATE:NH")).toEqual(["381", "382"]);
+  });
+});
+
+describe("leg repair economics (Oklahoma Senate, 2 Oct)", () => {
+  it("buys the short leg when that is worth more than dumping the long leg below cost", () => {
+    // Held: 2511 NO on D (avg 0.943) vs 2350 NO on R (avg 0.05). 161 extra D-NO shares.
+    const pf = new Portfolio(100_000);
+    pf.applyFill("381", "BUY_NO", 2511, 0.943, "t", { tradeType: "arbitrage" });
+    pf.applyFill("382", "BUY_NO", 2350, 0.05, "t", { tradeType: "arbitrage" });
+    pf.markArb("381", "NO", 2511, 2511 * 0.943);
+    pf.markArb("382", "NO", 2350, 2350 * 0.05);
+    pf.arbSets.set("2026:SENATE:NH", ["381", "382"]);
+    const ex = new PaperExecutionClient(pf);
+    // R YES bid 0.94 -> R NO costs 0.06; D YES ask 0.07 -> selling D NO gets 0.93, 2pp limit.
+    // Complete: pay 161 x 0.06 = 9.66 for 161 sets paying 161 -> worth 151.34.
+    // Trim: sell 161 D-NO at ~0.93 -> 149.73. Completing wins.
+    const books = new Map([["381", book("381", [[0.05, 5000]], [[0.07, 5000]])], ["382", book("382", [[0.94, 5000]], [[0.95, 5000]])]]);
+    const s: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() };
+    const cfg = mergeStrategy({ name: "t", arbitrage: false });
+    const r = runPortfolioTick({ state: s, signals: computeSignals(s, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
+    expect(r.logs.some((l) => /bought short legs up to 2511/.test(l.message))).toBe(true);
+    expect(pf.holdings("381").NO).toBe(2511);
+    expect(pf.holdings("382").NO).toBe(2511);
   });
 });
