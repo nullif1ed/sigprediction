@@ -86,6 +86,8 @@ export class Collector {
   live: LiveTrader | null = null;
   private liveReady = false;
   private liveFlush: Promise<void> | null = null;
+  private rtStartedAt = 0;
+  private rtRestarts = 0;
   private lastExternalAt = 0;
   private newsCursor = 0;
   private newsCredit = 0;
@@ -207,9 +209,20 @@ export class Collector {
             (b) => this.onRealtimeBook(b),
             (id) => this.resyncNeeded.add(id),
           );
+        this.rtStartedAt = Date.now();
         await this.rt.start(this.tournamentId, this.markets).catch((e) => log("ERROR", "realtime", "start_failed", { error: String(e) }));
       }
     }
+    // Realtime watchdog: reconnect (new token = 1 write) when the feed went silent, with backoff.
+    if (this.rt && !this.rt.healthy(90_000)) {
+      const backoff = Math.min(10 * 60_000, 60_000 * 2 ** Math.min(4, this.rtRestarts));
+      if (Date.now() - this.rtStartedAt > Math.max(90_000, backoff)) {
+        this.rtRestarts++;
+        this.rtStartedAt = Date.now();
+        log("WARNING", "realtime", "restarting", { restarts: this.rtRestarts, stats: this.rt.stats });
+        await this.rt.start(this.tournamentId, this.markets).catch((e) => log("ERROR", "realtime", "start_failed", { error: String(e) }));
+      }
+    } else if (this.rt?.healthy()) this.rtRestarts = 0;
 
     // 1. Top of book. The whole universe every UNIVERSE_POLL_SEC (ceil(N / 100) reads); in between,
     // only the hot set (held positions, arbitrage races, live signals) in a single read, so the
@@ -380,7 +393,9 @@ export class Collector {
     if (!this.tournamentId || !this.markets.length) return;
     try {
       if (!this.live) {
-        this.live = new LiveTrader(this.client, this.tournamentId, () => this.markets, () => this.portfolio, () => this.exec?.resetConsumption());
+        // The simulator keeps our consumed liquidity until a newer book shows that level changed,
+        // so a stale book can never make the engine re-buy depth we already took for real.
+        this.live = new LiveTrader(this.client, this.tournamentId, () => this.markets, () => this.portfolio);
       }
       await this.live.reconcile(true);
       this.liveReady = true;

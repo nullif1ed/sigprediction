@@ -9,7 +9,7 @@ import type {
   SizingStrategyName,
   YesBook,
 } from "./types";
-import { availableQuantity, bookStats, contractLevels, contractMid, round } from "./orderbook";
+import { availableQuantity, bookStats, contractLevels, contractMid, round, simulateExecution } from "./orderbook";
 import { DEFAULT_FAIR_VALUE, estimateFairValue, type FairValueParams } from "./fairValue";
 import { DEFAULT_IMPACT, headlineImpact, type ImpactParams } from "./news";
 import { DEFAULT_EVAL, evaluateMarket, rankOpportunities, type EvalParams } from "./opportunity";
@@ -345,29 +345,55 @@ export function runPortfolioTick(args: {
       const payout = contract === "NO" ? all.length - 1 : 1;
       const buy = (contract === "NO" ? "BUY_NO" : "BUY_YES") as Action;
       const sell = (contract === "NO" ? "SELL_NO" : "SELL_YES") as Action;
-      // Cost per completed set if the short legs are bought at the current touch.
+      // Two ways to make the legs equal again; pick the one worth more from here on (cost already
+      // paid is sunk): (A) buy the short legs up to `hi` and collect the payout on the extra sets,
+      // or (B) sell the excess legs down to `lo` now. Both walk the real book (VWAP), not the touch.
       const short = all.filter((l) => l.q < hi);
-      const touch = (id: string) => contractLevels(exec.book(id) ?? { exchangeId: "", marketId: id, bids: [], asks: [], asOf: "" }, buy)[0]?.price;
-      const completeCost = all.reduce((sum, l) => sum + (l.q >= hi ? l.avg : (touch(l.marketId) ?? 9)), 0);
+      const empty = (id: string): YesBook => ({ exchangeId: "", marketId: id, bids: [], asks: [], asOf: "" });
+      const n = hi - lo;
+      let buyCost = 0;
+      let buyOk = true;
+      const buys: { marketId: string; qty: number; limit: number }[] = [];
+      for (const l of short) {
+        const qty = hi - l.q;
+        const ex = simulateExecution(exec.book(l.marketId) ?? empty(l.marketId), buy, qty);
+        if (ex.filled < qty || ex.vwap === null || ex.worstPrice === null) buyOk = false;
+        else {
+          buyCost += ex.notional;
+          buys.push({ marketId: l.marketId, qty, limit: ex.worstPrice });
+        }
+      }
+      // Value of completing: the extra (hi - lo) sets pay `payout` each (shares beyond `lo` on the
+      // legs already at `hi` are the ones being completed).
+      const completeValue = buyOk ? payout * n - buyCost : -Infinity;
+      let sellValue = 0;
+      const sells: { marketId: string; qty: number; limit: number }[] = [];
+      for (const l of all.filter((x) => x.q > lo)) {
+        const qty = l.q - lo;
+        const bk = exec.book(l.marketId);
+        const best = bk ? contractLevels(bk, sell)[0]?.price : undefined;
+        if (best === undefined) continue;
+        const limit = round(Math.max(0.005, best - cfg.exits.maxExitSlippagePp), 4);
+        const ex = simulateExecution(bk!, sell, qty, limit);
+        sellValue += ex.notional;
+        sells.push({ marketId: l.marketId, qty: ex.filled, limit });
+      }
+      // Selling also gives up the payout the excess shares would have earned had the set been
+      // completed, so compare like for like: completing keeps them, selling cashes them now.
       const group = `repair:${race}:${ts}`;
-      if (completeCost <= payout - 0.002) {
-        for (const l of short) {
-          const qty = hi - l.q;
-          const px = touch(l.marketId)!;
-          const o = exec.submitOrder({ marketId: l.marketId, action: buy, quantity: qty, orderType: "market", limitPrice: px, tag: "arbitrage:repair:complete", group, meta: { tradeType: "arbitrage" } });
-          portfolio.markArb(l.marketId, contract, o.filledQuantity, o.filledQuantity * (o.fillPrice ?? 0));
+      if (buyOk && completeValue >= sellValue - 1e-9) {
+        for (const x of buys) {
+          const o = exec.submitOrder({ marketId: x.marketId, action: buy, quantity: x.qty, orderType: "market", limitPrice: x.limit, tag: "arbitrage:repair:complete", group, meta: { tradeType: "arbitrage" } });
+          portfolio.markArb(x.marketId, contract, o.filledQuantity, o.filledQuantity * (o.fillPrice ?? 0));
         }
-        out.logs.push({ level: "WARNING", message: `ARB repair ${race}: completed short legs to ${hi} sets (cost/set ${completeCost.toFixed(4)})`, context: { raceId: race } });
+        out.logs.push({ level: "WARNING", message: `ARB repair ${race}: bought short legs up to ${hi} sets (cost ${buyCost.toFixed(2)} for ${n} sets paying ${(payout * n).toFixed(2)}; selling instead would return ${sellValue.toFixed(2)})`, context: { raceId: race } });
       } else {
-        for (const l of all.filter((x) => x.q > lo)) {
-          const qty = l.q - lo;
-          const bk = exec.book(l.marketId);
-          const best = bk ? contractLevels(bk, sell)[0]?.price : undefined;
-          if (best === undefined) continue;
-          const o = exec.submitOrder({ marketId: l.marketId, action: sell, quantity: qty, orderType: "market", limitPrice: round(Math.max(0.005, best - cfg.exits.maxExitSlippagePp), 4), tag: "arbexit:repair", group });
-          portfolio.markArb(l.marketId, contract, -o.filledQuantity, 0);
+        for (const x of sells) {
+          if (x.qty <= 0) continue;
+          const o = exec.submitOrder({ marketId: x.marketId, action: sell, quantity: x.qty, orderType: "market", limitPrice: x.limit, tag: "arbexit:repair", group });
+          portfolio.markArb(x.marketId, contract, -o.filledQuantity, 0);
         }
-        out.logs.push({ level: "WARNING", message: `ARB repair ${race}: sold excess legs down to ${lo} sets`, context: { raceId: race } });
+        out.logs.push({ level: "WARNING", message: `ARB repair ${race}: sold excess legs down to ${lo} sets for ${sellValue.toFixed(2)} (completing would be worth ${Number.isFinite(completeValue) ? completeValue.toFixed(2) : "n/a: no depth"})`, context: { raceId: race } });
       }
     }
   }
