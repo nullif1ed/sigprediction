@@ -13,8 +13,9 @@ export const config = {
   tournamentSlug: process.env.SIG_TOURNAMENT_SLUG ?? "midterm-elections",
 
   // Published per-key limits (API reference, "Rate limits & retries"): standard keys get
-  // 100 reads per minute; 429 responses carry Retry-After: 60. Read-only, no writes/orders.
+  // 100 reads and 30 writes per minute; 429 responses carry Retry-After: 60.
   readsPerMinute: num("SIG_READS_PER_MIN", 100),
+  writesPerMinute: num("SIG_WRITES_PER_MIN", 30),
   rateSafety: num("SIG_RATE_SAFETY", 0.85),
   requestTimeoutMs: num("SIG_TIMEOUT_MS", 30_000),
 
@@ -49,6 +50,20 @@ export const config = {
   adminToken: process.env.BOT_ADMIN_TOKEN ?? "",
   /** Order books from SIG Realtime (no REST reads); REST is only used to resync. */
   realtime: process.env.REALTIME !== "0",
+  /** REAL orders on SIG (arbitrage only). Off unless LIVE_TRADING=1, and needs a trade-scope key. */
+  get liveTrading() {
+    return process.env.LIVE_TRADING === "1";
+  },
+  /** max notional (SUSQies) of one live order leg */
+  liveMaxOrderNotional: num("LIVE_MAX_ORDER_NOTIONAL", 25_000),
+  /** stop opening new live positions when account value falls this far below its start */
+  liveMaxDrawdown: num("LIVE_MAX_DRAWDOWN", 0.05),
+  /** non-arbitrage live entries older than this when their turn comes are dropped (stale) */
+  liveMaxOrderAgeSec: num("LIVE_MAX_ORDER_AGE_SEC", 20),
+  liveReconcileSec: num("LIVE_RECONCILE_SEC", 30),
+  /** Speed: send the first arbitrage leg at once (no order-book refetch) when every leg's book
+   * is at most this old; older books are refetched first to re-check the gap. */
+  liveFreshBookSec: num("LIVE_FRESH_BOOK_SEC", 5),
   /** Read-only token for GET /api/export/db (database download for offline backtests). Empty disables it. */
   get exportToken() {
     return process.env.BOT_EXPORT_TOKEN ?? "";

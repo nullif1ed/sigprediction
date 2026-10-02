@@ -20,15 +20,15 @@ import { computeSignals, mergeStrategy, runPortfolioTick, type StrategyConfig } 
 import { Portfolio } from "../core/portfolio";
 import { PaperExecutionClient } from "../core/execution";
 import { RealtimeBooks, type RealtimeStats } from "./realtime";
+import { LiveTrader, type LiveStats } from "./liveTrader";
 import { raceId, raceSampleScore } from "../core/races";
 import type { ScenarioRules } from "../core/sizing";
 
 // Data collector: polls SIG inside the published rate limit, stores order books, external
 // reference quotes and news headlines, and runs the paper-trading strategy against them.
 //
-// Paper trading only. This process never places a real order on SIG: the SIG API key it holds
-// only needs READ access (markets, order books, prices, news). There is no code path here that
-// calls a write/order-placement endpoint.
+// Paper trading by default (a read-only SIG key is enough). With LIVE_TRADING=1 and a trade-scope
+// key, the strategy's arbitrage orders are mirrored to SIG by LiveTrader.
 
 export interface CollectorStatus {
   running: boolean;
@@ -46,8 +46,9 @@ export interface CollectorStatus {
   rateLimited: number;
   priceIntervalSec: number;
   headlinesSeen: number;
-  executionMode: "paper";
+  executionMode: "paper" | "live";
   realtime: RealtimeStats | null;
+  live: LiveStats | null;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -84,6 +85,10 @@ export class Collector {
   /** markets whose realtime stream may have missed an update (refetch over REST) */
   resyncNeeded = new Set<string>();
   private rtStartedAt = 0;
+  liveMode = false;
+  live: LiveTrader | null = null;
+  private liveReady = false;
+  private liveFlush: Promise<void> | null = null;
   private lastFair = new Map<string, { p: number; confidence: number }>();
   private rtRestarts = 0;
   private lastExternalAt = 0;
@@ -118,14 +123,17 @@ export class Collector {
       rateLimited: this.client.rateLimited,
       priceIntervalSec: config.priceIntervalSec,
       headlinesSeen: [...this.headlines.values()].reduce((s, h) => s + h.length, 0),
-      executionMode: "paper",
+      executionMode: this.liveMode ? "live" : "paper",
       realtime: this.rt?.stats ?? null,
+      live: this.live?.stats ?? null,
     };
   }
 
   async start(opts: { paperTrading?: boolean; strategy?: Partial<StrategyConfig> } = {}) {
     if (this.running) return this.status();
     this.paperTrading = Boolean(opts.paperTrading);
+    this.liveMode = this.paperTrading && config.liveTrading && this.client.hasKey;
+    this.liveReady = false;
     if (opts.strategy) this.strategy = mergeStrategy({ ...opts.strategy, name: opts.strategy.name ?? "live-paper" });
     this.running = true;
     this.startedAt = this.now().toISOString();
@@ -143,7 +151,7 @@ export class Collector {
       }
     });
     if (this.paperTrading) this.initPaper();
-    log("INFO", "collector", "started", { runId: this.runId, paperTrading: this.paperTrading, readBudget: this.client.reads.capacity });
+    log("INFO", "collector", "started", { runId: this.runId, paperTrading: this.paperTrading, live: this.liveMode, readBudget: this.client.reads.capacity });
     this.loop = this.run();
     this.workers = Array.from({ length: Math.max(1, config.depthConcurrency) }, () => this.depthWorker());
     return this.status();
@@ -156,6 +164,7 @@ export class Collector {
     await this.loop?.catch(() => undefined);
     await Promise.all(this.workers.map((w) => w.catch(() => undefined)));
     this.workers = [];
+    await this.liveFlush?.catch(() => undefined);
     await this.rt?.stop().catch(() => undefined);
     this.rt = null;
     db().prepare("UPDATE collector_runs SET stopped_at = ?, status = 'stopped', ticks = ?, reads = ?, errors = ?, note = ? WHERE id = ?")
@@ -343,9 +352,16 @@ export class Collector {
       }
     }
 
-    // 5. Paper strategy only, on the same state the backtester replays. This process never sends
-    // an order to SIG - the SIG key it holds only needs read access.
-    if (this.paperTrading) this.paperTick(now);
+    // 5. Strategy on the same state the backtester replays; live mode mirrors fills to SIG.
+    if (this.paperTrading) {
+      if (this.liveMode && !this.liveReady) await this.initLive();
+      if (!this.liveMode || this.liveReady) this.paperTick(now);
+      if (this.live && this.liveReady && !this.liveFlush)
+        this.liveFlush = this.live.flush().finally(() => {
+          this.liveFlush = null;
+          this.savePaper();
+        });
+    }
 
     for (const [id, b] of this.books) {
       const mid = bookStats(b).mid;
@@ -420,6 +436,46 @@ export class Collector {
     this.resyncNeeded.delete(b.marketId);
   }
 
+  /** Live mode: start from SIG's real portfolio before the first decision. */
+  private async initLive() {
+    if (!this.tournamentId || !this.markets.length) return;
+    try {
+      if (!this.live) {
+        // The simulator keeps our consumed liquidity until a newer book shows that level changed,
+        // so a stale book can never make the engine re-buy depth we already took for real.
+        this.live = new LiveTrader(
+          this.client,
+          this.tournamentId,
+          () => this.markets,
+          () => this.portfolio,
+          undefined,
+          () => !this.strategy.regularTrading,
+          (id) => this.exec?.book(id) ?? this.books.get(id),
+          () => new Set(),
+          (id) => (this.books.get(id)?.topOnly ? Number.POSITIVE_INFINITY : this.now().getTime() - (this.depthFetchedAt.get(id) ?? 0)),
+        );
+      }
+      // Orders left by a previous process are untracked: cancel them before anything else.
+      try {
+        const r = await this.client.cancelAll(this.tournamentId);
+        log("WARNING", "live", "orphan_orders_cancelled", { cancelled: r.cancelled });
+      } catch (e) {
+        log("ERROR", "live", "orphan_cancel_failed", { error: String(e) });
+        return;
+      }
+      await this.live.reconcile(true);
+      this.live.aggressive = this.strategy.yolo;
+      this.liveReady = true;
+      log("WARNING", "live", "live_trading_started", { accountValue: this.live.stats.accountValue, positions: this.portfolio?.positions().length ?? 0 });
+    } catch (e) {
+      log("ERROR", "live", "initial_reconcile_failed", { error: String(e) });
+    }
+  }
+
+  private get pfKey() {
+    return this.liveMode ? "live_portfolio" : "paper_portfolio";
+  }
+
   /** Markets worth refreshing every fast tick. */
   hotMarkets(nowMs: number): Set<string> {
     const hot = new Set<string>();
@@ -454,11 +510,14 @@ export class Collector {
   }
 
   initPaper() {
-    const saved = kvGet<ReturnType<Portfolio["toJSON"]> | null>("paper_portfolio", null);
+    const saved = kvGet<ReturnType<Portfolio["toJSON"]> | null>(this.pfKey, null);
     this.portfolio = saved ? Portfolio.fromJSON(saved) : new Portfolio(config.initialBankroll);
     this.tradedHeadlines = new Set(kvGet<string[]>("paper_traded_headlines", []));
     this.exec = new PaperExecutionClient(this.portfolio, {
-      onOrder: (o) => upsertOrder(o),
+      onOrder: (o) => {
+        upsertOrder(o);
+        this.live?.capture(o);
+      },
       onFill: (f) => {
         insertFill(f);
         log("INFO", "paper", "fill", { ...f });
@@ -468,7 +527,7 @@ export class Collector {
 
   private savePaper() {
     if (!this.portfolio) return;
-    kvSet("paper_portfolio", this.portfolio.toJSON());
+    kvSet(this.pfKey, this.portfolio.toJSON());
     kvSet("paper_traded_headlines", [...this.tradedHeadlines].slice(-5000));
   }
 
@@ -476,7 +535,9 @@ export class Collector {
     if (!this.portfolio || !this.exec) return;
     const races = new Map(this.markets.map((m) => [m.id, m.race ? raceId(m.race) : m.id]));
     this.portfolio.raceOf = (id) => races.get(id) ?? id;
-    const state = { now, markets: this.markets, books: this.books, external: this.external, headlines: this.headlines, prevMids: this.prevMids };
+    // Live: decide only on full-depth books that are not waiting for a resync.
+    const books = this.liveMode ? new Map([...this.books].filter(([id, b]) => !b.topOnly && !this.resyncNeeded.has(id))) : this.books;
+    const state = { now, markets: this.markets, books, external: this.external, headlines: this.headlines, prevMids: this.prevMids };
     const signals = computeSignals(state, this.strategy);
     for (const [id, f] of signals.fair) this.lastFair.set(id, { p: f.fairProbability, confidence: f.confidence });
     // Keep the markets the strategy is looking at in the fast polling set for a minute.
