@@ -157,7 +157,7 @@ export class SwingCatcher {
       let o: { quantity: number; open: boolean } | undefined = byId.get(q.orderId);
       if (!o) o = await this.client.getOrder(q.orderId).catch(() => undefined);
       if (!o) continue;
-      const remaining = Number(o.quantity ?? 0);
+      const remaining = Math.abs(Number(o.quantity ?? 0));
       this.applyFill(st, q, q.remaining - remaining);
       q.remaining = remaining;
       if (!o.open || remaining <= 0) this.clear(st, q.contract);
@@ -190,7 +190,7 @@ export class SwingCatcher {
     }
     try {
       const o = await this.client.getOrder(q.orderId);
-      this.applyFill(st, q, q.remaining - Number(o.quantity ?? 0));
+      this.applyFill(st, q, q.remaining - Math.abs(Number(o.quantity ?? 0)));
     } catch {
       /* a late fill is picked up on reconcile at worst */
     }
@@ -271,7 +271,9 @@ export class SwingCatcher {
           const q: Rest = { orderId: Number(r.orderId), contract: c, price: px, remaining: qty, anchor: t.mid, placedAt: Date.now() };
           const filled = Number(r.quantityTraded ?? 0);
           if (filled > 0) this.applyFill(st, q, filled);
-          q.remaining = Number(r.remainingQuantity ?? qty - filled);
+          // SIG reports a NO order's remainder signed in YES terms (a resting 10-share NO buy says
+          // -10): use the magnitude, or the order goes untracked and is placed again every cycle.
+          q.remaining = Math.abs(Number(r.remainingQuantity ?? qty - filled));
           if (r.open && r.orderId && q.remaining >= 1) {
             if (c === "YES") st.yes = q;
             else st.no = q;
