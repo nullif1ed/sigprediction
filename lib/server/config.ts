@@ -18,7 +18,7 @@ export const config = {
   writesPerMinute: num("SIG_WRITES_PER_MIN", 30),
   // The budget is per account and shared with the dashboard / Vercel UI / live trader.
   rateSafety: num("SIG_RATE_SAFETY", 0.85),
-  requestTimeoutMs: num("SIG_TIMEOUT_MS", 12_000),
+  requestTimeoutMs: num("SIG_TIMEOUT_MS", 30_000),
 
   /** fast loop: top of book for the "hot" markets (positions, arbitrage races, live signals) */
   priceIntervalSec: num("PRICE_POLL_SEC", 2),
