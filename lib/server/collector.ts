@@ -405,7 +405,7 @@ export class Collector {
   /** Passive unwinds of large sets, every 15 s, after the live trader's own batch has settled. */
   private async passiveTick() {
     // Runs alongside the live trader's batch: the races it works on are excluded from the engine.
-    if (!this.tournamentId || !this.portfolio) return;
+    if (!this.tournamentId || !this.portfolio || this.strategy.yolo) return;
     if (!this.passive) this.passive = new PassiveUnwinder(this.client, this.tournamentId, () => this.markets, () => this.portfolio, (id) => this.books.get(id));
     if (Date.now() - this.passiveLast < 15_000) return;
     this.passiveLast = Date.now();
@@ -414,7 +414,7 @@ export class Collector {
 
   /** Market-making experiment: start once per MM_RUN_ID, then refresh quotes every MM_REFRESH_SEC. */
   private async mmTick() {
-    if (!config.mmEnabled || !this.tournamentId || !this.portfolio) return;
+    if (!config.mmEnabled || !this.tournamentId || !this.portfolio || this.strategy.yolo) return;
     if (!this.mm) {
       const done = kvGet<MMStats | null>("mm_experiment", null);
       if (done?.runId === config.mmRunId) {
@@ -480,6 +480,18 @@ export class Collector {
         return;
       }
       await this.live.reconcile(true);
+      this.live.aggressive = this.strategy.yolo;
+      if (config.liquidateRunId && kvGet<string | null>("liquidated", null) !== config.liquidateRunId) {
+        const left = await this.live.liquidateAll();
+        kvSet("liquidated", config.liquidateRunId);
+        if (this.portfolio) {
+          // Start the new strategy from the real post-liquidation state.
+          this.portfolio.peakEquity = this.portfolio.cash;
+          this.portfolio.maxDrawdown = 0;
+        }
+        await this.live.reconcile(true);
+        log("WARNING", "live", "liquidated_for_new_strategy", { runId: config.liquidateRunId, positionsLeft: left });
+      }
       this.liveReady = true;
       log("WARNING", "live", "live_trading_started", { accountValue: this.live.stats.accountValue, positions: this.portfolio?.positions().length ?? 0 });
     } catch (e) {

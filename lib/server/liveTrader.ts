@@ -4,7 +4,7 @@ import { log } from "./log";
 import { SigApiError, type OrderInput, type OrderResult, type SigClient } from "./sigClient";
 import type { Contract, PaperOrder, SigMarket, YesBook } from "../core/types";
 import type { Portfolio } from "../core/portfolio";
-import { availableQuantity, round } from "../core/orderbook";
+import { availableQuantity, contractLevels, round } from "../core/orderbook";
 import { raceId } from "../core/races";
 
 // LIVE execution on SIG.
@@ -57,6 +57,8 @@ const onTick = (p: number, dir: "up" | "down") => {
 const isExit = (o: PaperOrder) => /^(exit|arbexit)|:repair/.test(o.tag ?? "");
 
 export class LiveTrader {
+  /** YOLO: the first leg may pay up to break-even (market-like), not just half the planned profit */
+  aggressive = false;
   private queue: Pending[] = [];
   private busy = false;
   private lastReconcile = 0;
@@ -216,6 +218,53 @@ export class LiveTrader {
             p.tradeType = "arbitrage";
           }
         }
+  }
+
+  /**
+   * Sell EVERY position at the best prices available (no profit floor), walking each book as deep
+   * as needed. Several passes; anything the books cannot absorb is reported and retried later.
+   */
+  async liquidateAll(passes = 4): Promise<number> {
+    const pf = this.portfolio();
+    if (!pf) return -1;
+    const exchangeOf = new Map(this.markets().map((m) => [m.id, m.exchangeId]));
+    let left = 0;
+    for (let pass = 0; pass < passes; pass++) {
+      await this.reconcile();
+      const positions = pf.positions();
+      left = positions.length;
+      if (!left) break;
+      for (const p of positions) {
+        const b = this.getBook(p.marketId);
+        const ex = exchangeOf.get(p.marketId);
+        const action = p.contract === "YES" ? "SELL_YES" : "SELL_NO";
+        if (!b || !ex) continue;
+        const levels = contractLevels(b, action);
+        if (!levels.length) continue;
+        let need = p.quantity;
+        let limit = levels[0].price;
+        for (const lv of levels) {
+          limit = lv.price;
+          need -= lv.quantity;
+          if (need <= 0) break;
+        }
+        const qty = Math.floor(Math.min(p.quantity, this.real.get(`${p.marketId}:${p.contract}`) ?? 0));
+        if (qty <= 0) continue;
+        try {
+          const r = await this.client.placeOrder({ exchangeId: ex, side: p.contract === "YES" ? "yes" : "no", action: "sell", quantity: qty, price: onTick(limit, "down"), tournamentId: this.tournamentId, idempotencyKey: `liq-${randomUUID()}` });
+          if (r.open && r.orderId) await this.client.cancelOrder(r.orderId).catch(() => undefined);
+          log("WARNING", "live", "liquidate", { marketId: p.marketId, contract: p.contract, quantity: qty, limit, filled: r.quantityTraded, fillPrice: r.fillPrice, costBasis: round(qty * p.avgEntry, 2) });
+        } catch (e) {
+          this.fail("liquidate_failed", e, { marketId: p.marketId });
+        }
+      }
+    }
+    await this.reconcile();
+    pf.arb.clear();
+    pf.arbSets.clear();
+    left = pf.positions().length;
+    log("WARNING", "live", "liquidation_done", { positionsLeft: left, cash: this.stats.cash, accountValue: this.stats.accountValue });
+    return left;
   }
 
   /** Send everything queued (exits first), then reconcile. Never runs concurrently. */
@@ -378,9 +427,10 @@ export class LiveTrader {
       // at the price that still leaves the whole set profitable. The first leg may pay up to half
       // of the planned profit more than planned; later legs up to break-even + 0.1pp.
       const planned = order.reduce((s, x) => s + (x.input.price ?? 0), 0);
+      const slack = Math.max(0, payout - planned - 0.002);
       const cap =
         i === 0
-          ? Math.max(l.input.price!, onTick(l.input.price! + Math.max(0, payout - planned - 0.002) / 2, "down"))
+          ? Math.max(l.input.price!, onTick(l.input.price! + (this.aggressive ? slack : slack / 2), "down"))
           : onTick(payout - paid - laterPlanned - 0.001, "down");
       if (cap < 0.005) break;
       const input = { ...l.input, quantity: Math.floor(qty), price: Math.max(cap, 0.005) };

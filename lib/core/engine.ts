@@ -48,6 +48,16 @@ export interface StrategyConfig {
    * The regular exits (take profit / mean reversion) then sell it back.
    */
   snipe: boolean;
+  /**
+   * YOLO arbitrage: all capital into the most profitable sets (greedy by total profit, no per-race
+   * caps), exit a set once the market has converged (remaining profit < yoloConvergePp per set)
+   * and rotate out of a held set when a better one appears and the switch is worth more than the
+   * profit given up.
+   */
+  yolo: boolean;
+  yoloConvergePp: number;
+  /** a rotation must earn this multiple of the profit it gives up */
+  yoloRotateMargin: number;
   /** directional (regular + headline) entries; arbitrage always runs when `arbitrage` is on */
   regularTrading: boolean;
   snipeEdge: number;
@@ -76,6 +86,9 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   reentryCooldownMinutes: 30,
   addOnlyWhenProfitable: true,
   snipe: false,
+  yolo: true,
+  yoloConvergePp: 0.01,
+  yoloRotateMargin: 1.25,
   regularTrading: false,
   snipeEdge: 0.03,
   snipeMinConfidence: 0.5,
@@ -327,6 +340,101 @@ export function runPortfolioTick(args: {
     });
   };
 
+  /** YOLO arbitrage step: converge exits, rotation, then all-in entries. */
+  const yoloStep = () => {
+    type Held = { race: string; ids: string[]; sets: number; costPerSet: number; payout: number };
+    const held: Held[] = [];
+    for (const [race, ids] of portfolio.arbSets) {
+      if (ids.some((id) => skip.has(id)) || busyRaces.has(race)) continue;
+      const qs = ids.map((id) => portfolio.arbQty(id, "NO"));
+      const sets = Math.min(...qs);
+      if (sets < 1 || Math.max(...qs) - sets >= 1) continue;
+      const costPerSet = ids.reduce((sum, id) => {
+        const a = portfolio.arb.get(`${id}:NO`)!;
+        return sum + a.cost / a.quantity;
+      }, 0);
+      held.push({ race, ids, sets, costPerSet, payout: ids.length - 1 });
+    }
+    const exitLegs = (h: Held) => h.ids.map((id) => ({ marketId: id, action: "SELL_NO" as Action, book: exec.book(id)!, held: portfolio.arbQty(id, "NO") }));
+    const sell = (h: Held, u: NonNullable<ReturnType<typeof sizeUnwind>>, tag: string) => {
+      const group = `${tag}:${h.race}:${ts}`;
+      busyRaces.add(h.race);
+      for (const leg of u.legs) {
+        const o = exec.submitOrder({ marketId: leg.marketId, action: leg.action, quantity: u.q, orderType: "market", limitPrice: leg.limit, tag: `arbexit:${tag}`, group });
+        portfolio.markArb(leg.marketId, "NO", -o.filledQuantity, 0);
+        out.exits.push({ marketId: leg.marketId, contract: "NO", reason: tag, quantity: o.filledQuantity, price: o.fillPrice });
+      }
+      out.logs.push({ level: "INFO", message: `YOLO ${tag} ${h.race}: sold ${u.q} of ${h.sets} sets at ${(u.proceeds / u.q).toFixed(4)} (cost ${h.costPerSet.toFixed(4)}, P&L ${((u.proceeds / u.q - h.costPerSet) * u.q).toFixed(2)})`, context: { raceId: h.race } });
+    };
+
+    // 1. Converged: the remaining profit per set is under yoloConvergePp, and selling realizes a gain.
+    for (const h of held) {
+      if (exitLegs(h).some((l) => !l.book)) continue;
+      const u = sizeUnwind(exitLegs(h), Math.max(h.costPerSet + 0.0005, h.payout - cfg.yoloConvergePp));
+      if (u && u.q >= 1) sell(h, u, "converged");
+    }
+
+    // 2. Candidates, best total profit first (complete races, buy-all-NO, depth-limited).
+    const cands = liveArbs
+      .filter((a) => a.kind === "buy_all_no" && !busyRaces.has(a.raceId))
+      .filter((a) => {
+        const setIds = portfolio.arbSets.get(a.raceId);
+        if (!setIds) return !a.legs.some((l) => portfolio.holdings(l.marketId).YES > 0);
+        const qs = setIds.map((id) => portfolio.arbQty(id, "NO"));
+        return Math.max(...qs) - Math.min(...qs) < 1;
+      })
+      .sort((x, y) => y.totalProfit - x.totalProfit);
+    let budget = Math.max(0, portfolio.cash * 0.995);
+
+    // 3. Rotation: the best candidate cannot be funded; free capital from the held set whose full
+    //    exit gives up the least, if the new set's profit beats what is given up by the margin.
+    const best = cands[0];
+    if (best && budget < best.quantity * best.costPerSet * 0.5 && held.length) {
+      let pick: { h: Held; u: NonNullable<ReturnType<typeof sizeUnwind>>; foregone: number } | null = null;
+      for (const h of held) {
+        if (h.race === best.raceId || busyRaces.has(h.race) || exitLegs(h).some((l) => !l.book)) continue;
+        const u = sizeUnwind(exitLegs(h), 0);
+        if (!u || u.q < h.sets) continue; // only a complete exit frees the set cleanly
+        const foregone = h.sets * h.payout - u.proceeds;
+        if (!pick || foregone / u.proceeds < pick.foregone / pick.u.proceeds) pick = { h, u, foregone };
+      }
+      if (pick) {
+        const q = Math.min(best.quantity, Math.floor((budget + pick.u.proceeds) / best.costPerSet));
+        const gain = q * best.profitPerSet;
+        if (gain > cfg.yoloRotateMargin * Math.max(0, pick.foregone)) {
+          out.logs.push({ level: "WARNING", message: `YOLO rotate ${pick.h.race} -> ${best.raceId}: new profit ${gain.toFixed(2)} vs given up ${pick.foregone.toFixed(2)}`, context: { from: pick.h.race, to: best.raceId } });
+          sell(pick.h, pick.u, "rotate");
+          busyRaces.add(best.raceId); // enter next tick, once the freed cash is real
+        }
+      }
+    }
+
+    // 4. All in: fund the candidates in order of total profit with every unit of cash.
+    for (const a of cands) {
+      if (budget <= 0 || busyRaces.has(a.raceId)) continue;
+      const maxQ = Math.floor(budget / a.costPerSet);
+      if (maxQ < cfg.risk.minQuantity) continue;
+      const live = sizeSet(a.legs.map((l) => ({ marketId: l.marketId, action: l.action, book: exec.book(l.marketId)! })), a.guaranteedPayoutPerSet, Math.min(a.quantity, maxQ));
+      if (!live || live.legs.length !== a.legs.length || live.q < cfg.risk.minQuantity) continue;
+      const group = `arb:${a.raceId}:${ts}`;
+      portfolio.arbSets.set(a.raceId, [...new Set([...(portfolio.arbSets.get(a.raceId) ?? []), ...live.legs.map((l) => l.marketId)])]);
+      for (const leg of live.legs) {
+        const ladder = contractLevels(exec.book(leg.marketId)!, leg.action);
+        let left = live.q;
+        let worst = leg.price;
+        for (const lv of ladder) {
+          worst = lv.price;
+          left -= lv.quantity;
+          if (left <= 0) break;
+        }
+        const o = exec.submitOrder({ marketId: leg.marketId, action: leg.action, quantity: live.q, orderType: "market", limitPrice: worst, tag: `arbitrage:arbitrage:${a.kind}`, group, meta: { tradeType: "arbitrage" } });
+        portfolio.markArb(leg.marketId, "NO", o.filledQuantity, o.filledQuantity * (o.fillPrice ?? 0));
+      }
+      budget -= live.cost;
+      out.logs.push({ level: "INFO", message: `YOLO enter ${a.raceId}: ${live.q} sets at ${(live.cost / live.q).toFixed(4)} (profit ${(live.q * a.guaranteedPayoutPerSet - live.cost).toFixed(2)})`, context: { raceId: a.raceId } });
+    }
+  };
+
   /** races with a repair or unwind this tick: no new entry until the real orders have settled */
   const busyRaces = new Set<string>();
   // 2. Arbitrage leg repair. A set only locks in profit while every leg holds the same quantity.
@@ -410,6 +518,13 @@ export function runPortfolioTick(args: {
     }
   }
 
+  const liveArbs = cfg.arbitrage
+    ? detectArbitrage(
+        completeRaceMembers(state.markets, (id) => exec.book(id)).filter((x) => !skipRaces.has(raceId(x.race))),
+      )
+    : [];
+  if (cfg.yolo) yoloStep();
+  else {
   // 2a. Arbitrage unwind: a held set can often be sold back for most of its locked profit long
   // before settlement. Realising it frees the capital for the next set (other bots keep re-opening
   // the same spreads), and protects the gain if the set is still open at the tournament end.
@@ -459,11 +574,6 @@ export function runPortfolioTick(args: {
 
   // 2b. Arbitrage entry: allocate capital across ALL simultaneous sets by return on capital
   // (widest spread first), sized on the books net of our own earlier fills.
-  const liveArbs = cfg.arbitrage
-    ? detectArbitrage(
-        completeRaceMembers(state.markets, (id) => exec.book(id)).filter((x) => !skipRaces.has(raceId(x.race))),
-      )
-    : [];
   if (liveArbs.length) {
     const view = pfView();
     const settleDays = (a: ArbitrageOpportunity) => {
@@ -604,6 +714,8 @@ export function runPortfolioTick(args: {
         out.logs.push({ level: "INFO", message: `ARB ${a.kind} ${leg.action} ${o.filledQuantity}@${o.fillPrice}`, context: { marketId: leg.marketId, raceId: a.raceId } });
       }
     }
+  }
+
   }
 
   // 3. Headline trades (time sensitive).

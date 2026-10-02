@@ -109,7 +109,7 @@ describe("engine arbitrage execution", () => {
   const state = (b = books()): MarketState => ({ now: new Date("2026-10-02T16:00:00Z"), markets, books: b, external: new Map(), headlines: new Map() });
 
   it("opens multiple sets at once, sized by depth and capital, and does not re-buy the same liquidity", () => {
-    const cfg = mergeStrategy({ name: "arb", minNetEdge: 1 }); // isolate arbitrage
+    const cfg = mergeStrategy({ yolo: false, name: "arb", minNetEdge: 1 }); // isolate arbitrage
     const pf = new Portfolio(100_000);
     const races = new Map(markets.map((m) => [m.id, raceId(m.race!)]));
     pf.raceOf = (id) => races.get(id) ?? id;
@@ -136,7 +136,7 @@ describe("engine arbitrage execution", () => {
   });
 
   it("caps each race and total arbitrage capital", () => {
-    const cfg = mergeStrategy({ name: "arb", minNetEdge: 1, risk: { ...mergeStrategy({ name: "x" }).risk, maxArbRacePct: 0.01 } });
+    const cfg = mergeStrategy({ yolo: false, name: "arb", minNetEdge: 1, risk: { ...mergeStrategy({ name: "x" }).risk, maxArbRacePct: 0.01 } });
     const pf = new Portfolio(100_000);
     const races = new Map(markets.map((m) => [m.id, raceId(m.race!)]));
     pf.raceOf = (id) => races.get(id) ?? id;

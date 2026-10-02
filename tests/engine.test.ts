@@ -27,7 +27,7 @@ function state(over: Partial<MarketState> = {}): MarketState {
 
 describe("strategy engine", () => {
   it("buys the underpriced side, sizes within limits and explains why", () => {
-    const cfg = mergeStrategy({ name: "t", regularTrading: true });
+    const cfg = mergeStrategy({ yolo: false, name: "t", regularTrading: true });
     const s = state();
     const pf = new Portfolio(100_000);
     const ex = new PaperExecutionClient(pf);
@@ -45,7 +45,7 @@ describe("strategy engine", () => {
 
   it("ignores headlines that were not yet known (no look-ahead)", () => {
     const future: NewsHeadline = { id: "h", marketId: "381", url: "", title: "Poll", source: "The New York Times", summary: "", publishedDate: "2026-10-03", relevanceExplanation: "raises the likelihood of a Democratic win", firstSeenAt: "2026-10-03T00:00:00Z" };
-    const cfg = mergeStrategy({ name: "t" });
+    const cfg = mergeStrategy({ yolo: false, name: "t" });
     const sNo = computeSignals(state(), cfg);
     const sFuture = computeSignals(state({ headlines: new Map([["381", [future]]]) }), cfg);
     expect(sFuture.headlines).toHaveLength(0);
@@ -58,7 +58,7 @@ describe("strategy engine", () => {
   it("trades a fresh headline once, tagged as a headline trade", () => {
     const h: NewsHeadline = { id: "h", marketId: "381", url: "", title: "Poll", source: "The New York Times", summary: "Democrat leading", publishedDate: "2026-10-02", relevanceExplanation: "raises the likelihood of a Democratic win and strengthens the lead", firstSeenAt: "2026-10-02T15:59:00Z" };
     const s = state({ books: new Map([["381", book("381", [[0.84, 2000]], [[0.86, 2000]])], ["382", book("382", [[0.13, 2000]], [[0.17, 2000]])]]), headlines: new Map([["381", [h]]]) });
-    const cfg = mergeStrategy({ name: "t", regularTrading: true });
+    const cfg = mergeStrategy({ yolo: false, name: "t", regularTrading: true });
     const pf = new Portfolio(100_000);
     const ex = new PaperExecutionClient(pf);
     const traded = new Set<string>();
@@ -74,7 +74,7 @@ describe("strategy engine", () => {
       books: new Map([["381", book("381", [[0.6, 500]], [[0.62, 500]])], ["382", book("382", [[0.45, 500]], [[0.47, 500]])]]),
       external: new Map(),
     });
-    const cfg = mergeStrategy({ name: "t" });
+    const cfg = mergeStrategy({ yolo: false, name: "t" });
     const pf = new Portfolio(100_000);
     const ex = new PaperExecutionClient(pf);
     const sig = computeSignals(s, cfg);
@@ -91,13 +91,13 @@ describe("arbitrage bookkeeping (regressions from the 1 Oct paper run)", () => {
       ["381", book("381", [[0.6, 500]], [[0.62, 500]])],
       ["382", book("382", [[0.45, 500]], [[0.47, 500]])],
     ]);
-  const tick = (pf: Portfolio, ex: PaperExecutionClient, s: MarketState, cfg = mergeStrategy({ name: "t" })) =>
+  const tick = (pf: Portfolio, ex: PaperExecutionClient, s: MarketState, cfg = mergeStrategy({ yolo: false, name: "t" })) =>
     runPortfolioTick({ state: s, signals: computeSignals(s, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
 
   it("locks arbitrage shares: no regular trade nets against them and exits never sell them", () => {
     const pf = new Portfolio(100_000);
     const ex = new PaperExecutionClient(pf);
-    const cfg = mergeStrategy({ name: "t", risk: { ...mergeStrategy({}).risk, arbUnwind: false } });
+    const cfg = mergeStrategy({ yolo: false, name: "t", risk: { ...mergeStrategy({}).risk, arbUnwind: false } });
     tick(pf, ex, state({ books: arbBooks(), external: new Map() }), cfg);
     const locked = pf.arbQty("381", "NO");
     expect(locked).toBe(500);
@@ -144,7 +144,7 @@ describe("sniping mispriced resting orders", () => {
         ["382", book("382", [[0.13, 2000]], [[0.17, 2000]])],
       ]),
     });
-    const cfg = mergeStrategy({ name: "t", minNetEdge: 9, snipe: true }); // isolate the snipe step
+    const cfg = mergeStrategy({ yolo: false, name: "t", minNetEdge: 9, snipe: true }); // isolate the snipe step
     const pf = new Portfolio(100_000);
     const ex = new PaperExecutionClient(pf);
     const r = runPortfolioTick({ state: s, signals: computeSignals(s, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "auto", rules: null, tradedHeadlines: new Set() });
