@@ -32,6 +32,7 @@ function fakeSig(fill: (leg: { exchangeId: string; quantity: number; price: numb
     if (path === "/orders/multi-leg") return json({ results: body.legs.map((l: never, index: number) => ({ index, data: place(l) })) });
     if (path === "/orders") return json(place(body));
     if (path === "/orders/cancel-all") return json({ cancelled: 1 });
+    if (init?.method === "DELETE" && path.startsWith("/orders/")) return json({ orderId: 1, message: "cancelled" });
     if (path.endsWith("/portfolio/positions"))
       return json({ positions: [...held].filter(([, q]) => q !== 0).map(([exchangeId, q]) => ({ exchangeId, marketId: exchangeId === "1070" ? "381" : "382", marketTitle: "", settled: false, quantity: q, avgCost: 0.5, currentPrice: 0.5, marketValue: 0, costBasis: 0, lots: [] })), summary: {} });
     if (path.endsWith("/portfolio/pnl")) {
@@ -49,8 +50,10 @@ const state = (books: Map<string, YesBook>): MarketState => ({ now: new Date("20
 function setup(fill: (leg: { exchangeId: string; quantity: number; price: number }) => number) {
   const sig = fakeSig(fill);
   const pf = new Portfolio(100_000);
-  const live = new LiveTrader(sig.client, "t1", () => markets, () => pf);
+  const ref: { ex?: PaperExecutionClient } = {};
+  const live = new LiveTrader(sig.client, "t1", () => markets, () => pf, undefined, () => true, (id) => ref.ex?.book(id));
   const ex = new PaperExecutionClient(pf, { onOrder: (o: PaperOrder) => live.capture(o) });
+  ref.ex = ex;
   const cfg = mergeStrategy({ name: "t" });
   const tick = (books: Map<string, YesBook>) => runPortfolioTick({ state: state(books), signals: computeSignals(state(books), cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
   return { ...sig, pf, live, tick };
@@ -60,39 +63,33 @@ function setup(fill: (leg: { exchangeId: string; quantity: number; price: number
 const arbBooks = () => new Map([["381", book("381", [[0.6, 500]], [[0.62, 500]])], ["382", book("382", [[0.45, 500]], [[0.47, 500]])]]);
 
 describe("live execution", () => {
-  it("sends an arbitrage set as ONE multi-leg request of on-tick limit orders, then reconciles", async () => {
+  it("enters a set one leg at a time: each next leg sized to what filled, with a set-profitable limit", async () => {
     const t = setup((l) => l.quantity);
     await t.live.reconcile(true);
     t.tick(arbBooks());
     await t.live.flush();
-    const ml = t.calls.filter((c) => c.path === "/orders/multi-leg");
-    expect(ml).toHaveLength(1);
-    const legs = ml[0].body!.legs as { side: string; action: string; quantity: number; price: number; exchangeId: string }[];
-    expect(legs.map((l) => [l.exchangeId, l.side, l.action, l.quantity, l.price])).toEqual([
-      ["1070", "no", "buy", 500, 0.4],
-      ["1071", "no", "buy", 500, 0.55],
-    ]);
-    expect(typeof ml[0].body!.idempotencyKey).toBe("string");
-    expect(t.calls.some((c) => c.path === "/orders/cancel-all")).toBe(false); // fully filled
-    // Portfolio now mirrors the exchange.
+    const legs = t.calls.filter((c) => c.path === "/orders").map((c) => c.body as { exchangeId: string; side: string; action: string; quantity: number; price: number });
+    expect(legs).toHaveLength(2);
+    expect(legs.every((l) => l.side === "no" && l.action === "buy" && l.quantity === 500)).toBe(true);
+    // Second leg limit: payout 1 - first leg price paid - 0.1pp, on the 0.005 tick.
+    const first = legs[0].exchangeId === "1070" ? 0.4 : 0.55;
+    expect(legs[1].price).toBeCloseTo(Math.floor((1 - first - 0.001) / 0.005) * 0.005, 6);
     expect(t.pf.holdings("381").NO).toBe(500);
     expect(t.pf.arbQty("382", "NO")).toBe(500);
-    expect(t.live.stats.sharesFilled).toBe(1000);
   });
 
-  it("cancels resting remainders and repairs a set left with one short leg", async () => {
-    // Leg 1070 fills completely, leg 1071 only 200 of 500.
-    const t = setup((l) => (l.exchangeId === "1071" ? 200 : l.quantity));
+  it("TX-15 case: a partial first leg shrinks the second leg to match", async () => {
+    // Bottleneck leg 1071 only fills 124 of 500: the other leg must buy 124, not 500.
+    const t = setup((l) => (l.exchangeId === "1071" ? 124 : l.quantity));
     await t.live.reconcile(true);
-    t.tick(arbBooks());
+    const thin = new Map([["381", book("381", [[0.6, 5000]], [[0.62, 500]])], ["382", book("382", [[0.45, 500]], [[0.47, 500]])]]);
+    t.tick(thin);
     await t.live.flush();
-    expect(t.calls.some((c) => c.path === "/orders/cancel-all")).toBe(true);
-    expect(t.pf.arbQty("381", "NO")).toBe(500);
-    expect(t.pf.arbQty("382", "NO")).toBe(200);
-    // Next tick (a NEWER book: the real fills changed the levels): completing costs 0.40 + 0.55 =
-    // 0.95 < 1, so the short leg is bought, not dumped.
-    const r = t.tick(new Map([["381", book("381", [[0.6, 9000]], [[0.62, 500]])], ["382", book("382", [[0.45, 8000]], [[0.47, 500]])]]));
-    expect(r.logs.some((l) => /ARB repair .* bought short legs/.test(l.message))).toBe(true);
+    const legs = t.calls.filter((c) => c.path === "/orders").map((c) => c.body as { exchangeId: string; quantity: number });
+    expect(legs[0].exchangeId).toBe("1071"); // least depth relative to size goes first
+    expect(legs[1]).toMatchObject({ exchangeId: "1070", quantity: 124 });
+    expect(Math.abs(t.held.get("1070")!)).toBe(124);
+    expect(Math.abs(t.held.get("1071")!)).toBe(124);
   });
 
   it("never sells more than is really held (an unbacked sell would become a buy)", async () => {
@@ -116,7 +113,7 @@ describe("live execution", () => {
     t.tick(new Map([["381", book("381", [[0.59, 5000]], [[0.6, 5000]])], ["382", book("382", [[0.39, 5000]], [[0.4, 5000]])]]));
     await t.live.flush();
     const ml = t.calls.filter((c) => c.path === "/orders/multi-leg");
-    const unwind = ml[1].body!.legs as { action: string; quantity: number }[];
+    const unwind = ml[0].body!.legs as { action: string; quantity: number }[];
     expect(unwind.map((l) => [l.action, l.quantity])).toEqual([["sell", 500], ["sell", 500]]);
     expect(t.pf.holdings("381").NO).toBe(0);
     expect(t.pf.holdings("382").NO).toBe(0);
@@ -160,7 +157,7 @@ describe("no duplicate entries", () => {
     await t.live.flush();
     t.tick(arbBooks()); // same (stale) book after the reconcile
     await t.live.flush();
-    expect(t.calls.filter((c) => c.path === "/orders/multi-leg")).toHaveLength(1);
+    expect(t.calls.filter((c) => c.path === "/orders")).toHaveLength(2);
     expect(t.pf.holdings("381").NO).toBe(500);
   });
 });
@@ -242,10 +239,13 @@ describe("live position hygiene (2 Oct account)", () => {
 
 describe("no accumulation into unbalanced sets", () => {
   it("does not add a new clip to a race whose legs are unequal", async () => {
-    const t = setup((l) => (l.exchangeId === "1071" ? 200 : l.quantity));
+    const t = setup((l) => l.quantity);
     await t.live.reconcile(true);
     t.tick(arbBooks());
-    await t.live.flush(); // 500 vs 200
+    await t.live.flush();
+    t.held.set("1070", -500);
+    t.held.set("1071", -200);
+    await t.live.reconcile(); // 500 vs 200
     const before = t.calls.filter((c) => c.path === "/orders/multi-leg").length;
     // Fresh book with the same spread: the engine must repair, not open another set.
     const r = t.tick(new Map([["381", book("381", [[0.6, 9000]], [[0.62, 500]])], ["382", book("382", [[0.45, 9000]], [[0.47, 500]])]]));
