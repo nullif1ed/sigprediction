@@ -63,7 +63,7 @@ describe("collector -> paper trading -> backtest (mock API)", () => {
     const client = new SigClient({ apiKey: "k", baseUrl: "https://sig.test/api/v1", siteUrl: "https://sig.test", fetchFn: (async (u: string) => sigFetch(u)) as unknown as typeof fetch, sleep: async () => {}, readsPerMinute: 10_000 });
     const c = new Collector(client, () => new Date(now));
     c.paperTrading = true;
-    c.strategy = mergeStrategy({ name: "it", regularTrading: true });
+    c.strategy = mergeStrategy({ yolo: false, name: "it", regularTrading: true });
     c.initPaper();
     for (tick = 0; tick < nhAsk.length; tick++) {
       await c.tick();

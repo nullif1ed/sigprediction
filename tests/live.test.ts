@@ -54,7 +54,7 @@ function setup(fill: (leg: { exchangeId: string; quantity: number; price: number
   const live = new LiveTrader(sig.client, "t1", () => markets, () => pf, undefined, () => true, (id) => ref.ex?.book(id));
   const ex = new PaperExecutionClient(pf, { onOrder: (o: PaperOrder) => live.capture(o) });
   ref.ex = ex;
-  const cfg = mergeStrategy({ name: "t" });
+  const cfg = mergeStrategy({ yolo: false, name: "t" });
   const tick = (books: Map<string, YesBook>) => runPortfolioTick({ state: state(books), signals: computeSignals(state(books), cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
   return { ...sig, pf, live, tick };
 }
@@ -192,7 +192,7 @@ describe("leg repair economics (Oklahoma Senate, 2 Oct)", () => {
     // Trim: sell 161 D-NO at ~0.93 -> 149.73. Completing wins.
     const books = new Map([["381", book("381", [[0.05, 5000]], [[0.07, 5000]])], ["382", book("382", [[0.94, 5000]], [[0.95, 5000]])]]);
     const s: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() };
-    const cfg = mergeStrategy({ name: "t", arbitrage: false });
+    const cfg = mergeStrategy({ yolo: false, name: "t", arbitrage: false });
     const r = runPortfolioTick({ state: s, signals: computeSignals(s, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
     expect(r.logs.some((l) => /bought short legs up to 2511/.test(l.message))).toBe(true);
     expect(pf.holdings("381").NO).toBe(2511);
@@ -210,7 +210,7 @@ describe("live position hygiene (2 Oct account)", () => {
     expect(pf.arbSets.get("2026:SENATE:NH")).toEqual(["381", "382"]);
     expect(pf.arbQty("381", "NO")).toBe(574);
     const ex = new PaperExecutionClient(pf);
-    const cfg = mergeStrategy({ name: "t", arbitrage: false });
+    const cfg = mergeStrategy({ yolo: false, name: "t", arbitrage: false });
     // R YES bid 0.95 -> buying R NO costs 0.05: completing 574 sets pays 574 for 28.70 -> do it.
     const books = new Map([["381", book("381", [[0.04, 5000]], [[0.05, 5000]])], ["382", book("382", [[0.95, 5000]], [[0.96, 5000]])]]);
     const st: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() };
@@ -228,7 +228,7 @@ describe("live position hygiene (2 Oct account)", () => {
     pf.markArb("382", "NO", 148, 148 * 0.46);
     pf.arbSets.set("2026:SENATE:NH", ["381", "382"]);
     const ex = new PaperExecutionClient(pf);
-    const cfg = mergeStrategy({ name: "t", arbitrage: false });
+    const cfg = mergeStrategy({ yolo: false, name: "t", arbitrage: false });
     // Selling both NO legs returns (1-0.42) + (1-0.525) = 1.055 > payout 1 (but < cost 1.06).
     const books = new Map([["381", book("381", [[0.41, 5000]], [[0.42, 5000]])], ["382", book("382", [[0.52, 5000]], [[0.525, 5000]])]]);
     const st: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() };
@@ -277,7 +277,7 @@ describe("incomplete and mixed races (NE Senate, 2 Oct)", () => {
     // YES asks 0.08 + 0.30 = 0.38 on two of three outcomes looks like 'buy all YES' if 281 is missing.
     const books = new Map([["279", book("279", [[0.07, 5000]], [[0.08, 5000]])], ["280", book("280", [[0.29, 5000]], [[0.3, 5000]])]]);
     const st: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets: NE, books, external: new Map(), headlines: new Map() };
-    const cfg = mergeStrategy({ name: "t" });
+    const cfg = mergeStrategy({ yolo: false, name: "t" });
     expect(computeSignals(st, cfg).arbitrage).toHaveLength(0);
     const pf = new Portfolio(100_000);
     const r = runPortfolioTick({ state: st, signals: computeSignals(st, cfg), cfg, portfolio: pf, exec: new PaperExecutionClient(pf), sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
@@ -325,11 +325,28 @@ describe("YES positions are never completed into a set (MT Senate, 2 Oct)", () =
     await live.reconcile();
     expect(pf.arbQty("381", "YES")).toBe(0);
     const ex = new PaperExecutionClient(pf);
-    const cfg = mergeStrategy({ name: "t", arbitrage: false });
+    const cfg = mergeStrategy({ yolo: false, name: "t", arbitrage: false });
     const books = new Map([["381", book("381", [[0.9, 5000]], [[0.91, 5000]])], ["382", book("382", [[0.05, 5000]], [[0.06, 5000]])]]);
     const st: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() };
     const r = runPortfolioTick({ state: st, signals: computeSignals(st, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
     expect(r.logs.some((l) => /ARB repair/.test(l.message))).toBe(false);
     expect(pf.holdings("382").YES).toBe(0);
+  });
+});
+
+describe("liquidate all (switch to YOLO)", () => {
+  it("sells every position at the best available prices and clears set records", async () => {
+    const sig = fakeSig((l) => l.quantity);
+    const pf = new Portfolio(100_000);
+    const books = arbBooks();
+    const live = new LiveTrader(sig.client, "t1", () => markets, () => pf, undefined, () => true, (id) => books.get(id));
+    sig.held.set("1070", -500);
+    sig.held.set("1071", -300);
+    await live.reconcile(true);
+    const left = await live.liquidateAll(2);
+    expect(left).toBe(0);
+    const sells = sig.calls.filter((c) => c.path === "/orders").map((c) => c.body as { action: string; side: string; quantity: number });
+    expect(sells.every((x) => x.action === "sell" && x.side === "no")).toBe(true);
+    expect(pf.arbSets.size).toBe(0);
   });
 });
