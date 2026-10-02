@@ -14,7 +14,7 @@ const markets = [mk("381", "1070", "Will the Democratic Party win the New Hampsh
 const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
 
 /** Minimal fake SIG: records orders, fills a configurable fraction, serves positions. */
-function fakeSig(fill: (leg: { exchangeId: string; quantity: number; price: number }) => number) {
+function fakeSig(fill: (leg: { exchangeId: string; quantity: number; price: number }) => number, fresh?: Map<string, YesBook>) {
   const calls: { path: string; body: Record<string, unknown> | null }[] = [];
   const held = new Map<string, number>(); // exchangeId -> signed qty (+YES, -NO)
   let cash = 100_000;
@@ -29,6 +29,11 @@ function fakeSig(fill: (leg: { exchangeId: string; quantity: number; price: numb
       cash += (leg.action === "buy" ? -1 : 1) * q * leg.price;
       return { orderId: calls.length, exchangeId: leg.exchangeId, open: q < leg.quantity, remainingQuantity: leg.quantity - q, quantityTraded: q, totalCost: q * leg.price, fillPrice: q ? leg.price : null };
     };
+    const ob = path.match(/^\/markets\/(\w+)\/orderbook$/);
+    if (ob && fresh?.has(ob[1])) {
+      const b = fresh.get(ob[1])!;
+      return json({ exchanges: [{ exchangeId: b.exchangeId, asOf: null, bids: b.bids, asks: b.asks }] });
+    }
     if (path === "/orders/multi-leg") return json({ results: body.legs.map((l: never, index: number) => ({ index, data: place(l) })) });
     if (path === "/orders") return json(place(body));
     if (path === "/orders/cancel-all") return json({ cancelled: 1 });
@@ -47,8 +52,8 @@ function fakeSig(fill: (leg: { exchangeId: string; quantity: number; price: numb
 
 const state = (books: Map<string, YesBook>): MarketState => ({ now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() });
 
-function setup(fill: (leg: { exchangeId: string; quantity: number; price: number }) => number) {
-  const sig = fakeSig(fill);
+function setup(fill: (leg: { exchangeId: string; quantity: number; price: number }) => number, fresh?: Map<string, YesBook>) {
+  const sig = fakeSig(fill, fresh);
   const pf = new Portfolio(100_000);
   const ref: { ex?: PaperExecutionClient } = {};
   const live = new LiveTrader(sig.client, "t1", () => markets, () => pf, undefined, () => true, (id) => ref.ex?.book(id));
@@ -348,5 +353,31 @@ describe("liquidate all (switch to YOLO)", () => {
     const sells = sig.calls.filter((c) => c.path === "/orders").map((c) => c.body as { action: string; side: string; quantity: number });
     expect(sells.every((x) => x.action === "sell" && x.side === "no")).toBe(true);
     expect(pf.arbSets.size).toBe(0);
+  });
+});
+
+describe("YOLO entry on fresh books (2 Oct: every set was dropped as stale)", () => {
+  it("sends a set even when SIG was slow, re-sized to the depth on the fresh books, equal shares", async () => {
+    // Fresh books: the 382 bid now holds only 200 at 0.45, then 0.40 (set would cost 1.00: not profitable).
+    const fresh = new Map([["381", book("381", [[0.6, 500]], [[0.62, 500]])], ["382", book("382", [[0.45, 200], [0.4, 300]], [[0.47, 500]])]]);
+    const t = setup((l) => l.quantity, fresh);
+    await t.live.reconcile(true);
+    t.tick(arbBooks());
+    // Simulate a slow round trip: the set was queued long before the flush ran.
+    (t.live as unknown as { queue: { queuedAt: number }[] }).queue.forEach((q) => (q.queuedAt -= 120_000));
+    await t.live.flush();
+    const legs = t.calls.filter((c) => c.path === "/orders").map((c) => c.body as { quantity: number; side: string });
+    expect(legs).toHaveLength(2);
+    expect(legs.every((l) => l.side === "no" && l.quantity === 200)).toBe(true);
+    expect(t.live.stats.dropped).toBe(0);
+  });
+
+  it("skips the set when the fresh books no longer show a profit", async () => {
+    const fresh = new Map([["381", book("381", [[0.55, 500]], [[0.57, 500]])], ["382", book("382", [[0.44, 500]], [[0.46, 500]])]]);
+    const t = setup((l) => l.quantity, fresh);
+    await t.live.reconcile(true);
+    t.tick(arbBooks());
+    await t.live.flush();
+    expect(t.calls.filter((c) => c.path === "/orders")).toHaveLength(0);
   });
 });
