@@ -53,7 +53,7 @@ export const config = {
   liveReconcileSec: num("LIVE_RECONCILE_SEC", 30),
   /** Market-making experiment (live only). Runs once per MM_RUN_ID; set MM_ENABLED=0 to skip. */
   mmEnabled: process.env.MM_ENABLED !== "0",
-  mmRunId: process.env.MM_RUN_ID ?? "mm-exp-1",
+  mmRunId: process.env.MM_RUN_ID ?? "mm-exp-2",
   mmMarkets: num("MM_MARKETS", 3),
   mmSize: num("MM_SIZE", 500),
   mmMaxPos: num("MM_MAX_POS", 2000),
