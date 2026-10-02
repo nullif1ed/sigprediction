@@ -126,6 +126,9 @@ export class LiveTrader {
     }
     const cash = round(pnl.totalAccountValue - pnl.totalHoldingsValue, 4);
     pf.syncFromExchange(rows, cash, new Date().toISOString());
+    // Drop YES locks recorded by older versions: only NO sets are arbitrage now.
+    for (const k of [...pf.arb.keys()]) if (k.endsWith(":YES")) pf.arb.delete(k);
+    for (const [race, ids] of [...pf.arbSets]) if (!ids.some((id) => pf.arb.has(`${id}:NO`))) pf.arbSets.delete(race);
     this.inferSets(pf);
     this.adoptLegs(pf);
     this.real = new Map(rows.map((r) => [`${r.marketId}:${r.contract}`, r.quantity]));

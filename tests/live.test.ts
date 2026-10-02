@@ -312,3 +312,24 @@ describe("first leg limit", () => {
     expect(legs[0].price + legs[1].price).toBeLessThan(1);
   });
 });
+
+describe("YES positions are never completed into a set (MT Senate, 2 Oct)", () => {
+  it("drops stale YES locks on reconcile and does not buy the missing YES leg", async () => {
+    const sig = fakeSig((l) => l.quantity);
+    const pf = new Portfolio(100_000);
+    const live = new LiveTrader(sig.client, "t1", () => markets, () => pf, undefined, () => true);
+    sig.held.set("1070", 862); // YES on 381 only, locked by an older version as a "YES set"
+    pf.applyFill("381", "BUY_YES", 862, 0.9, "t", { tradeType: "arbitrage" });
+    pf.markArb("381", "YES", 862, 862 * 0.9);
+    pf.arbSets.set("2026:SENATE:NH", ["381", "382"]);
+    await live.reconcile();
+    expect(pf.arbQty("381", "YES")).toBe(0);
+    const ex = new PaperExecutionClient(pf);
+    const cfg = mergeStrategy({ name: "t", arbitrage: false });
+    const books = new Map([["381", book("381", [[0.9, 5000]], [[0.91, 5000]])], ["382", book("382", [[0.05, 5000]], [[0.06, 5000]])]]);
+    const st: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() };
+    const r = runPortfolioTick({ state: st, signals: computeSignals(st, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
+    expect(r.logs.some((l) => /ARB repair/.test(l.message))).toBe(false);
+    expect(pf.holdings("382").YES).toBe(0);
+  });
+});
