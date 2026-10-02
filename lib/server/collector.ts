@@ -21,6 +21,8 @@ import { Portfolio } from "../core/portfolio";
 import { PaperExecutionClient } from "../core/execution";
 import { RealtimeBooks, type RealtimeStats } from "./realtime";
 import { LiveTrader, type LiveStats } from "./liveTrader";
+import { MarketMaker, type MMStats } from "./marketMaker";
+import { PassiveUnwinder, type PassiveStats } from "./passiveUnwind";
 import { raceId } from "../core/races";
 import type { ScenarioRules } from "../core/sizing";
 
@@ -47,6 +49,8 @@ export interface CollectorStatus {
   executionMode: "paper" | "live";
   realtime: RealtimeStats | null;
   live: LiveStats | null;
+  mm: MMStats | null;
+  passive: PassiveStats | null;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -87,6 +91,12 @@ export class Collector {
   private liveReady = false;
   private liveFlush: Promise<void> | null = null;
   private rtStartedAt = 0;
+  mm: MarketMaker | null = null;
+  passive: PassiveUnwinder | null = null;
+  private passiveLast = 0;
+  private mmBusy: Promise<void> | null = null;
+  private mmLast = 0;
+  private lastFair = new Map<string, { p: number; confidence: number }>();
   private rtRestarts = 0;
   private lastExternalAt = 0;
   private newsCursor = 0;
@@ -123,6 +133,8 @@ export class Collector {
       executionMode: this.liveMode ? "live" : "paper",
       realtime: this.rt?.stats ?? null,
       live: this.live?.stats ?? null,
+      mm: this.mm?.stats ?? kvGet<MMStats | null>("mm_experiment", null),
+      passive: this.passive?.stats ?? null,
     };
   }
 
@@ -162,6 +174,10 @@ export class Collector {
     await Promise.all(this.workers.map((w) => w.catch(() => undefined)));
     this.workers = [];
     await this.liveFlush?.catch(() => undefined);
+    await this.mmBusy?.catch(() => undefined);
+    if (this.mm && !this.mm.finished) await this.mm.finish("collector_stopped").catch(() => undefined);
+    await this.passive?.stop().catch(() => undefined);
+    if (this.mm) kvSet("mm_experiment", this.mm.stats);
     await this.rt?.stop().catch(() => undefined);
     this.rt = null;
     db().prepare("UPDATE collector_runs SET stopped_at = ?, status = 'stopped', ticks = ?, reads = ?, errors = ?, note = ? WHERE id = ?")
@@ -314,6 +330,11 @@ export class Collector {
           this.liveFlush = null;
           this.savePaper();
         });
+      if (this.liveMode && this.liveReady && !this.mmBusy)
+        this.mmBusy = (async () => {
+          await this.passiveTick();
+          await this.mmTick();
+        })().finally(() => (this.mmBusy = null));
     }
 
     for (const [id, b] of this.books) {
@@ -376,6 +397,44 @@ export class Collector {
     }
   }
 
+  /** Markets owned by the market maker or a resting passive unwind: the engine leaves them alone. */
+  private ownedMarkets(): Set<string> {
+    return new Set([...(this.mm?.skip() ?? []), ...(this.passive?.owned() ?? [])]);
+  }
+
+  /** Passive unwinds of large sets, every 15 s, after the live trader's own batch has settled. */
+  private async passiveTick() {
+    if (!this.tournamentId || !this.portfolio || this.liveFlush) return;
+    if (!this.passive) this.passive = new PassiveUnwinder(this.client, this.tournamentId, () => this.markets, () => this.portfolio, (id) => this.books.get(id));
+    if (Date.now() - this.passiveLast < 15_000) return;
+    this.passiveLast = Date.now();
+    await this.passive.cycle();
+  }
+
+  /** Market-making experiment: start once per MM_RUN_ID, then refresh quotes every MM_REFRESH_SEC. */
+  private async mmTick() {
+    if (!config.mmEnabled || !this.tournamentId || !this.portfolio) return;
+    if (!this.mm) {
+      const done = kvGet<MMStats | null>("mm_experiment", null);
+      if (done?.runId === config.mmRunId && (done.status === "finished" || done.status === "failed")) return;
+      if (!(this.rt?.healthy() ?? false) || this.ticks < 5) return; // need fresh full books
+      this.mm = new MarketMaker(this.client, this.tournamentId, (id) => this.books.get(id), (id) => this.lastFair.get(id) ?? null, config.mmRunId);
+      const busy = new Set([...this.portfolio.arbSets.keys()]);
+      const held = new Set(this.portfolio.positions().map((p) => p.marketId));
+      for (const id of held) {
+        const m = this.markets.find((x) => x.id === id);
+        if (m?.race) busy.add(raceId(m.race));
+      }
+      await this.mm.select(this.markets, busy, held);
+      kvSet("mm_experiment", this.mm.stats);
+      return;
+    }
+    if (this.mm.finished || Date.now() - this.mmLast < config.mmRefreshSec * 1000) return;
+    this.mmLast = Date.now();
+    await this.mm.cycle();
+    kvSet("mm_experiment", this.mm.stats);
+  }
+
   private onRealtimeBook(b: YesBook) {
     this.books.set(b.marketId, b);
     this.depthFetchedAt.set(b.marketId, this.now().getTime());
@@ -395,7 +454,16 @@ export class Collector {
       if (!this.live) {
         // The simulator keeps our consumed liquidity until a newer book shows that level changed,
         // so a stale book can never make the engine re-buy depth we already took for real.
-        this.live = new LiveTrader(this.client, this.tournamentId, () => this.markets, () => this.portfolio, undefined, () => !this.strategy.regularTrading, (id) => this.exec?.book(id) ?? this.books.get(id));
+        this.live = new LiveTrader(
+          this.client,
+          this.tournamentId,
+          () => this.markets,
+          () => this.portfolio,
+          undefined,
+          () => !this.strategy.regularTrading,
+          (id) => this.exec?.book(id) ?? this.books.get(id),
+          () => this.ownedMarkets(),
+        );
       }
       await this.live.reconcile(true);
       this.liveReady = true;
@@ -472,6 +540,7 @@ export class Collector {
     const books = this.liveMode ? new Map([...this.books].filter(([id, b]) => !b.topOnly && !this.resyncNeeded.has(id))) : this.books;
     const state = { now, markets: this.markets, books, external: this.external, headlines: this.headlines, prevMids: this.prevMids };
     const signals = computeSignals(state, this.strategy);
+    for (const [id, f] of signals.fair) this.lastFair.set(id, { p: f.fairProbability, confidence: f.confidence });
     // Keep the markets the strategy is looking at in the fast polling set for a minute.
     const until = now.getTime() + 60_000;
     for (const a of signals.arbitrage) for (const l of a.legs) this.hotUntil.set(l.marketId, until);
@@ -487,6 +556,7 @@ export class Collector {
       rules,
       tradedHeadlines: this.tradedHeadlines,
       onDecision: (d) => insertDecision(d),
+      skipMarkets: this.ownedMarkets(),
     });
     for (const l of r.logs) log(l.level, "paper", l.message, l.context ?? {});
     const snap = this.portfolio.snapshot(this.books, now.toISOString());
