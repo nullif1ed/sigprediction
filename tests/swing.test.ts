@@ -93,4 +93,19 @@ describe("swing catcher (deep resting orders)", () => {
     await sw.cycle();
     expect(f.orders.size).toBe(0);
   });
+
+  it("keeps a fresh fill even before the portfolio has reconciled it", async () => {
+    const f = fake();
+    const books = new Map<string, YesBook>([["293", book("293", [[0.6, 5000]], [[0.61, 5000]])]]);
+    const sw = new SwingCatcher(f.client, "t", () => markets, (id) => books.get(id), () => new Set(), () => 0, () => 100_000);
+    await sw.cycle();
+    const yesId = [...f.orders].find(([, o]) => o.side === "yes")![0];
+    f.fill(yesId);
+    books.set("293", book("293", [[0.55, 5000]], [[0.56, 5000]]));
+    await sw.cycle(); // held() still reports 0: not reconciled yet
+    await sw.cycle();
+    expect(sw.owned().has("293")).toBe(true);
+    // ...and no new bid is placed on a market holding a swing position.
+    expect([...f.orders.values()].filter((o) => o.open)).toHaveLength(0);
+  });
 });
