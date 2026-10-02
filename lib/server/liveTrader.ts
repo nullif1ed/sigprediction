@@ -178,6 +178,8 @@ export class LiveTrader {
     const skip = this.skipMarkets();
     for (const [race, members] of byRace) {
       if (members.length < 2 || pf.arbSets.has(race) || members.some((m) => skip.has(m.id))) continue;
+      // Mixed YES/NO holdings are a directional position, not a set: never adopt them.
+      if (members.some((m) => pf.holdings(m.id).YES > 0) && members.some((m) => pf.holdings(m.id).NO > 0)) continue;
       for (const c of ["NO", "YES"] as Contract[]) {
         const free = members.map((m) => pf.freeHoldings(m.id)[c]);
         const need = this.allPositionsAreArb() ? Math.max(...free) : Math.min(...free);

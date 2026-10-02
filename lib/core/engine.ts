@@ -169,13 +169,7 @@ export function computeSignals(state: MarketState, cfg: StrategyConfig): Signals
     for (const f of fresh) if (Math.abs(f.shift) >= cfg.minHeadlineShift) headlineSignals.push(f);
   }
 
-  const arbitrage = cfg.arbitrage
-    ? detectArbitrage(
-        state.markets
-          .filter((m) => m.race && state.books.has(m.id))
-          .map((m) => ({ marketId: m.id, race: m.race!, book: state.books.get(m.id)! })),
-      )
-    : [];
+  const arbitrage = cfg.arbitrage ? detectArbitrage(completeRaceMembers(state.markets, (id) => state.books.get(id))) : [];
   return { fair, headlines: headlineSignals, arbitrage };
 }
 
@@ -212,6 +206,13 @@ export function runPortfolioTick(args: {
   const ts = state.now.toISOString();
 
   // 1. Re-evaluate and exit existing positions (arbitrage-locked shares are managed separately).
+  /** a race where we hold YES on some markets and NO on others: directional, never arbitraged */
+  const mixedRace = (race: string) => {
+    const ids = state.markets.filter((m) => m.race && raceId(m.race) === race).map((m) => m.id);
+    const yes = ids.some((id) => portfolio.holdings(id).YES > 0);
+    const no = ids.some((id) => portfolio.holdings(id).NO > 0);
+    return yes && no;
+  };
   const skip = args.skipMarkets ?? new Set<string>();
   const skipRaces = new Set(state.markets.filter((m) => skip.has(m.id) && m.race).map((m) => raceId(m.race!)));
   for (const p of portfolio.positions()) {
@@ -342,6 +343,7 @@ export function runPortfolioTick(args: {
       byRace.set(r, [...(byRace.get(r) ?? []), { marketId, contract, q, avg: v.cost / Math.max(1, v.quantity) }]);
     }
     for (const [race, legs] of byRace) {
+      if (mixedRace(race)) continue;
       const setIds = portfolio.arbSets.get(race) ?? legs.map((l) => l.marketId);
       const contract = legs[0].contract;
       if (legs.some((l) => l.contract !== contract)) continue;
@@ -419,7 +421,7 @@ export function runPortfolioTick(args: {
       byRace.set(r, [...(byRace.get(r) ?? []), { marketId, contract }]);
     }
     for (const [race, held] of byRace) {
-      if (held.length < 2 || held.some((h) => h.contract !== held[0].contract)) continue;
+      if (held.length < 2 || held.some((h) => h.contract !== held[0].contract) || mixedRace(race)) continue;
       const legs = held.map((h) => ({
         marketId: h.marketId,
         action: (h.contract === "YES" ? "SELL_YES" : "SELL_NO") as Action,
@@ -457,9 +459,7 @@ export function runPortfolioTick(args: {
   // (widest spread first), sized on the books net of our own earlier fills.
   const liveArbs = cfg.arbitrage
     ? detectArbitrage(
-        state.markets
-          .filter((m) => m.race && exec.book(m.id) && !skipRaces.has(raceId(m.race)))
-          .map((m) => ({ marketId: m.id, race: m.race!, book: exec.book(m.id)! })),
+        completeRaceMembers(state.markets, (id) => exec.book(id)).filter((x) => !skipRaces.has(raceId(x.race))),
       )
     : [];
   if (liveArbs.length) {
@@ -472,12 +472,14 @@ export function runPortfolioTick(args: {
     for (const a of liveArbs) {
       // Buying a leg's contract while holding the opposite (regular) side would net the two
       // positions instead of opening the set; skip those races.
-      const conflict = a.legs.some((l) => {
-        const c = l.action.endsWith("YES") ? "NO" : "YES";
-        return portfolio.freeHoldings(l.marketId)[c] > 0;
-      });
+      // Buying a leg's contract while holding the opposite side (locked or not) would net the
+      // positions away instead of opening the set; and a race with mixed YES/NO holdings is not a
+      // set at all. Skip both.
+      const c0 = a.legs[0].action.endsWith("YES") ? "YES" : "NO";
+      const conflict = mixedRace(a.raceId) || a.legs.some((l) => portfolio.holdings(l.marketId)[c0 === "YES" ? "NO" : "YES"] > 0);
       if (conflict) continue;
       if (busyRaces.has(a.raceId)) continue;
+      if (a.kind === "buy_all_yes" && !cfg.risk.allowBuyAllYes) continue;
       // Never add to a race whose held legs are unequal: repair balances it first.
       const setIds = portfolio.arbSets.get(a.raceId);
       if (setIds) {
@@ -662,6 +664,23 @@ export function runPortfolioTick(args: {
     const m = titles.get(o.marketId)!;
     const f = signals.fair.get(o.marketId)!;
     execute(o, scenarioOf(o, daysTo(m.settlementDate, state.now)), (f.upperBound - f.lowerBound) / 3.92);
+  }
+  return out;
+}
+
+/**
+ * Members of races whose EVERY listed market has a usable book. A race with a missing book must
+ * not be arbitraged: buy-all-YES over a subset is a bet on that subset, and buy-all-NO payouts
+ * depend on the full outcome set (NE Senate, 2 Oct: one missing book turned into a 14k YES bet).
+ */
+export function completeRaceMembers(markets: SigMarket[], book: (id: string) => YesBook | undefined) {
+  const byRace = new Map<string, SigMarket[]>();
+  for (const m of markets) if (m.race) byRace.set(raceId(m.race), [...(byRace.get(raceId(m.race)) ?? []), m]);
+  const out: { marketId: string; race: NonNullable<SigMarket["race"]>; book: YesBook }[] = [];
+  for (const ms of byRace.values()) {
+    const books = ms.map((m) => book(m.id));
+    if (ms.length < 2 || books.some((b) => !b || (!b.bids.length && !b.asks.length))) continue;
+    ms.forEach((m, i) => out.push({ marketId: m.id, race: m.race!, book: books[i]! }));
   }
   return out;
 }
