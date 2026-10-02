@@ -321,6 +321,8 @@ export function runPortfolioTick(args: {
     });
   };
 
+  /** races with a repair or unwind this tick: no new entry until the real orders have settled */
+  const busyRaces = new Set<string>();
   // 2. Arbitrage leg repair. A set only locks in profit while every leg holds the same quantity.
   // Live, one leg can fill less than another (or a late fill lands), leaving a naked leg. Complete
   // the set when that is still profitable; otherwise sell the excess (limit-protected).
@@ -381,6 +383,7 @@ export function runPortfolioTick(args: {
       // Selling also gives up the payout the excess shares would have earned had the set been
       // completed, so compare like for like: completing keeps them, selling cashes them now.
       const group = `repair:${race}:${ts}`;
+      busyRaces.add(race);
       if (buyOk && completeValue >= sellValue - 1e-9) {
         for (const x of buys) {
           const o = exec.submitOrder({ marketId: x.marketId, action: buy, quantity: x.qty, orderType: "market", limitPrice: x.limit, tag: "arbitrage:repair:complete", group, meta: { tradeType: "arbitrage" } });
@@ -430,6 +433,7 @@ export function runPortfolioTick(args: {
       const u = sizeUnwind(legs, need);
       if (!u || u.q < Math.min(cfg.risk.minQuantity, Math.min(...legs.map((l) => l.held)))) continue;
       const group = `unwind:${race}:${ts}`;
+      busyRaces.add(race);
       for (const leg of u.legs) {
         const contract = leg.action.endsWith("YES") ? "YES" : "NO";
         const o = exec.submitOrder({ marketId: leg.marketId, action: leg.action, quantity: u.q, orderType: "market", limitPrice: leg.limit, tag: "arbexit:unwind", group });
@@ -468,6 +472,14 @@ export function runPortfolioTick(args: {
         return portfolio.freeHoldings(l.marketId)[c] > 0;
       });
       if (conflict) continue;
+      if (busyRaces.has(a.raceId)) continue;
+      // Never add to a race whose held legs are unequal: repair balances it first.
+      const setIds = portfolio.arbSets.get(a.raceId);
+      if (setIds) {
+        const c = a.legs[0].action.endsWith("YES") ? "YES" : "NO";
+        const qs = setIds.map((id) => portfolio.arbQty(id, c));
+        if (Math.max(...qs) - Math.min(...qs) >= 1) continue;
+      }
       let convergence = 1;
       if (a.conditional) {
         if (!cfg.risk.allowConditionalArb) continue;
@@ -481,7 +493,7 @@ export function runPortfolioTick(args: {
       budget,
       raceCap: (race) => {
         const leg = liveArbs.find((x) => x.raceId === race)?.legs[0]?.marketId;
-        return view.equity * cfg.risk.maxArbRacePct - (leg ? portfolio.raceArbExposure(leg) : 0);
+        return Math.min(cfg.risk.maxArbClipNotional, view.equity * cfg.risk.maxArbRacePct - (leg ? portfolio.raceArbExposure(leg) : 0));
       },
       minQuantity: cfg.risk.minQuantity,
       minReturn: cfg.risk.minArbReturn + cfg.risk.minArbReturnPerUtil * (view.equity > 0 ? portfolio.arbExposure() / view.equity : 0),
