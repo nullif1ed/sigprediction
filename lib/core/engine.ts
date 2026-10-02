@@ -424,7 +424,9 @@ export function runPortfolioTick(args: {
       if (held.length < setSize) continue; // a leg is missing: the repair step handles it
       const payout = held[0].contract === "NO" ? setSize - 1 : 1;
       const locked = payout - costPerSet;
-      const need = costPerSet + Math.max(cfg.risk.arbUnwindMinPp, cfg.risk.arbUnwindCapture * locked);
+      // Sell once most of the locked profit is available, and ALWAYS when selling beats holding to
+      // settlement (proceeds above the payout, e.g. a set that was entered too expensively).
+      const need = Math.min(costPerSet + Math.max(cfg.risk.arbUnwindMinPp, cfg.risk.arbUnwindCapture * Math.max(0, locked)), payout + cfg.risk.arbUnwindMinPp);
       const u = sizeUnwind(legs, need);
       if (!u || u.q < Math.min(cfg.risk.minQuantity, Math.min(...legs.map((l) => l.held)))) continue;
       const group = `unwind:${race}:${ts}`;

@@ -166,13 +166,16 @@ describe("no duplicate entries", () => {
 });
 
 describe("reconcile", () => {
-  it("recognises a complete set held on SIG as arbitrage even without local records", async () => {
+  it("recognises a set held on SIG as arbitrage and locks every share so repair can balance it", async () => {
     const t = setup((l) => l.quantity);
     t.held.set("1070", -300);
-    t.held.set("1071", -300);
+    t.held.set("1071", -420);
     await t.live.reconcile(true);
     expect(t.pf.arbQty("381", "NO")).toBe(300);
+    expect(t.pf.arbQty("382", "NO")).toBe(420);
     expect(t.pf.arbSets.get("2026:SENATE:NH")).toEqual(["381", "382"]);
+    // Secured value counts the 300 complete sets at their payout (1 each), not at SIG's mid.
+    expect(t.live.stats.securedValue).toBeGreaterThan(0);
   });
 });
 
@@ -196,5 +199,43 @@ describe("leg repair economics (Oklahoma Senate, 2 Oct)", () => {
     expect(r.logs.some((l) => /bought short legs up to 2511/.test(l.message))).toBe(true);
     expect(pf.holdings("381").NO).toBe(2511);
     expect(pf.holdings("382").NO).toBe(2511);
+  });
+});
+
+describe("live position hygiene (2 Oct account)", () => {
+  it("adopts a lone leg whose partner never filled, and repair then completes or sells it", async () => {
+    const sig = fakeSig((l) => l.quantity);
+    const pf = new Portfolio(100_000);
+    const live = new LiveTrader(sig.client, "t1", () => markets, () => pf, undefined, () => true);
+    sig.held.set("1070", -574); // NO on 381 only
+    await live.reconcile(true);
+    expect(pf.arbSets.get("2026:SENATE:NH")).toEqual(["381", "382"]);
+    expect(pf.arbQty("381", "NO")).toBe(574);
+    const ex = new PaperExecutionClient(pf);
+    const cfg = mergeStrategy({ name: "t", arbitrage: false });
+    // R YES bid 0.95 -> buying R NO costs 0.05: completing 574 sets pays 574 for 28.70 -> do it.
+    const books = new Map([["381", book("381", [[0.04, 5000]], [[0.05, 5000]])], ["382", book("382", [[0.95, 5000]], [[0.96, 5000]])]]);
+    const st: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() };
+    const r = runPortfolioTick({ state: st, signals: computeSignals(st, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
+    expect(r.logs.some((l) => /bought short legs up to 574 sets/.test(l.message))).toBe(true);
+    // The completed set is then worth more sold back (0.99) than its cost: it is unwound at once.
+    expect(r.exits.filter((e) => e.reason === "arb_unwind")).toHaveLength(2);
+  });
+
+  it("sells a set whose sale beats its payout, even if it was bought above the payout", () => {
+    const pf = new Portfolio(100_000);
+    pf.applyFill("381", "BUY_NO", 148, 0.6, "t", { tradeType: "arbitrage" });
+    pf.applyFill("382", "BUY_NO", 148, 0.46, "t", { tradeType: "arbitrage" });
+    pf.markArb("381", "NO", 148, 148 * 0.6);
+    pf.markArb("382", "NO", 148, 148 * 0.46);
+    pf.arbSets.set("2026:SENATE:NH", ["381", "382"]);
+    const ex = new PaperExecutionClient(pf);
+    const cfg = mergeStrategy({ name: "t", arbitrage: false });
+    // Selling both NO legs returns (1-0.42) + (1-0.525) = 1.055 > payout 1 (but < cost 1.06).
+    const books = new Map([["381", book("381", [[0.41, 5000]], [[0.42, 5000]])], ["382", book("382", [[0.52, 5000]], [[0.525, 5000]])]]);
+    const st: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets, books, external: new Map(), headlines: new Map() };
+    const r = runPortfolioTick({ state: st, signals: computeSignals(st, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
+    expect(r.exits.filter((e) => e.reason === "arb_unwind")).toHaveLength(2);
+    expect(pf.holdings("381").NO).toBe(0);
   });
 });

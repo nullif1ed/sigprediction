@@ -29,6 +29,8 @@ export interface LiveStats {
   halted: string | null;
   startValue: number | null;
   accountValue: number | null;
+  /** cash + guaranteed payout of complete arbitrage sets + market value of other holdings */
+  securedValue: number | null;
   cash: number | null;
   ordersSent: number;
   ordersFilled: number;
@@ -51,7 +53,8 @@ const onTick = (p: number, dir: "up" | "down") => {
   const k = dir === "up" ? Math.ceil(p / TICK - 1e-9) : Math.floor(p / TICK + 1e-9);
   return round(Math.min(0.995, Math.max(0.005, k * TICK)), 3);
 };
-const isExit = (o: PaperOrder) => (o.tag ?? "").startsWith("exit") || (o.tag ?? "").startsWith("arbexit");
+// Exits, unwinds and leg repairs reduce risk: they are sent first and never dropped.
+const isExit = (o: PaperOrder) => /^(exit|arbexit)|:repair/.test(o.tag ?? "");
 
 export class LiveTrader {
   private queue: Pending[] = [];
@@ -64,6 +67,7 @@ export class LiveTrader {
     halted: null,
     startValue: null,
     accountValue: null,
+    securedValue: null,
     cash: null,
     ordersSent: 0,
     ordersFilled: 0,
@@ -81,8 +85,13 @@ export class LiveTrader {
     private tournamentId: string,
     private markets: () => SigMarket[],
     private portfolio: () => Portfolio | null,
-    /** called after each reconcile (the collector clears the simulator's consumption overlay) */
+    /** called after each reconcile */
     private onReconciled: () => void = () => {},
+    /**
+     * When directional trading is off, every position on a race is (part of) an arbitrage set,
+     * including a lone leg whose partner never filled: adopt it so leg repair balances it.
+     */
+    private allPositionsAreArb: () => boolean = () => false,
   ) {}
 
   /** Called for every order the engine's execution client creates. */
@@ -114,13 +123,30 @@ export class LiveTrader {
     const cash = round(pnl.totalAccountValue - pnl.totalHoldingsValue, 4);
     pf.syncFromExchange(rows, cash, new Date().toISOString());
     this.inferSets(pf);
+    this.adoptLegs(pf);
     this.real = new Map(rows.map((r) => [`${r.marketId}:${r.contract}`, r.quantity]));
     this.stats.accountValue = round(pnl.totalAccountValue, 2);
     this.stats.cash = round(cash, 2);
-    if (initial || this.stats.startValue === null) this.stats.startValue = this.stats.accountValue;
-    const dd = this.stats.startValue ? 1 - this.stats.accountValue / this.stats.startValue : 0;
+    // SIG values NO shares near the mid, so a freshly bought set always "shows" a loss although its
+    // payout is fixed. Judge drawdown on secured value: cash + guaranteed payout of complete sets +
+    // market value of everything else.
+    const price = new Map(pos.positions.map((p) => [`${byExchange.get(String(p.exchangeId)) ?? p.marketId}:${p.quantity > 0 ? "YES" : "NO"}`, p.currentPrice ?? p.avgCost]));
+    let secured = cash;
+    const counted = new Map<string, number>();
+    for (const [race, ids] of pf.arbSets) {
+      void race;
+      const q = Math.min(...ids.map((id) => pf.holdings(id).NO));
+      if (q > 0 && ids.length > 1) {
+        secured += q * (ids.length - 1);
+        for (const id of ids) counted.set(`${id}:NO`, q);
+      }
+    }
+    for (const r of rows) secured += Math.max(0, r.quantity - (counted.get(`${r.marketId}:${r.contract}`) ?? 0)) * (price.get(`${r.marketId}:${r.contract}`) ?? r.avgEntry);
+    this.stats.securedValue = round(secured, 2);
+    if (initial || this.stats.startValue === null) this.stats.startValue = this.stats.securedValue;
+    const dd = this.stats.startValue ? 1 - secured / this.stats.startValue : 0;
     if (dd >= config.liveMaxDrawdown && !this.stats.halted) {
-      this.stats.halted = `account value ${this.stats.accountValue} is ${(dd * 100).toFixed(1)}% below start ${this.stats.startValue}`;
+      this.stats.halted = `secured value ${this.stats.securedValue} is ${(dd * 100).toFixed(1)}% below start ${this.stats.startValue}`;
       log("ERROR", "live", "halted_new_entries", { reason: this.stats.halted });
     }
     this.lastReconcile = Date.now();
@@ -139,17 +165,34 @@ export class LiveTrader {
       if (members.length < 2 || pf.arbSets.has(race)) continue;
       for (const c of ["NO", "YES"] as Contract[]) {
         const free = members.map((m) => pf.freeHoldings(m.id)[c]);
-        const q = Math.min(...free);
-        if (q < 1) continue;
-        for (const m of members) {
-          const p = pf.get(m.id, c)!;
-          pf.markArb(m.id, c, q, q * p.avgEntry);
+        const need = this.allPositionsAreArb() ? Math.max(...free) : Math.min(...free);
+        if (need < 1) continue;
+        // Lock EVERY share of each leg, not just the matched part: unequal legs are then balanced by
+        // the engine's leg repair (complete or trim, whichever is worth more).
+        for (const [i, m] of members.entries()) {
+          const p = pf.get(m.id, c);
+          if (!p || free[i] < 1) continue;
+          pf.markArb(m.id, c, free[i], free[i] * p.avgEntry);
           p.tradeType = "arbitrage";
         }
         pf.arbSets.set(race, members.map((m) => m.id));
-        log("WARNING", "live", "arb_set_inferred", { raceId: race, contract: c, sets: q });
+        log("WARNING", "live", "arb_set_inferred", { raceId: race, contract: c, legs: free });
       }
     }
+  }
+
+  /** Shares bought outside a set's lock (late fills, earlier versions) on a race that has a set: lock them too. */
+  private adoptLegs(pf: Portfolio) {
+    for (const ids of pf.arbSets.values())
+      for (const id of ids)
+        for (const c of ["NO", "YES"] as Contract[]) {
+          const extra = pf.freeHoldings(id)[c];
+          const p = pf.get(id, c);
+          if (extra > 0 && p && pf.arbQty(id, c) > 0) {
+            pf.markArb(id, c, extra, extra * p.avgEntry);
+            p.tradeType = "arbitrage";
+          }
+        }
   }
 
   /** Send everything queued (exits first), then reconcile. Never runs concurrently. */

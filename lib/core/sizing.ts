@@ -44,7 +44,7 @@ export const DEFAULT_RISK: RiskConfig = {
   allowConditionalArb: false,
   minConvergence: 0.97,
   arbUnwind: true,
-  arbUnwindCapture: 0.2,
+  arbUnwindCapture: 0.1,
   arbUnwindMinPp: 0.002,
 };
 
