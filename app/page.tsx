@@ -8,10 +8,10 @@ interface Status {
   statefulMode: "local" | "proxy" | "unavailable";
   hasApiKey: boolean;
   tournament: string;
-  rateLimits: { readsPerMinute: number; safety: number; source: string };
+  rateLimits: { readsPerMinute: number; writesPerMinute?: number; safety: number; source: string };
   polling: { priceIntervalSec: number; externalIntervalSec: number; newsMarketsPerMinute: number };
   adminTokenRequired: boolean;
-  executionMode?: "paper";
+  executionMode?: "paper" | "live";
 }
 interface CollectorResp {
   status: {
@@ -23,7 +23,8 @@ interface CollectorResp {
     depthBooks: number;
     paperTrading: boolean;
     lastError: string | null;
-    executionMode?: "paper";
+    executionMode?: "paper" | "live";
+    live?: { accountValue: number | null; securedValue: number | null; startValue: number | null; cash: number | null; ordersSent: number; ordersFilled: number; errors: number; halted: string | null } | null;
     readsLastMinute: number;
     readBudgetPerMinute: number;
     rateLimited: number;
@@ -70,6 +71,24 @@ export default function Dashboard() {
   useEffect(() => setTok(localStorage.getItem("botToken") ?? ""), []);
 
   const s = col.data?.status;
+  const [liq, setLiq] = useState<string | null>(null);
+  const liquidate = async () => {
+    if (!confirm("Stop the bot, cancel ALL open orders and MARKET-SELL every position on your SIG account now? Market orders take whatever the book offers, so this usually realizes a loss.")) return;
+    setBusy(true);
+    setErr(null);
+    setLiq("Liquidating... (can take a few minutes while SIG is slow)");
+    try {
+      const r = await api<{ cancelledOrders: number; sells: { filled: number; quantity: number; error?: string }[]; positionsLeft: number; openOrdersLeft: number; accountValue: number | null }>("/api/live/liquidate", { method: "POST", body: "{}" });
+      const failed = r.sells.filter((x) => x.error || x.filled < x.quantity).length;
+      setLiq(`Done: cancelled ${r.cancelledOrders} orders, ${r.sells.length} market sells (${failed} incomplete). Positions left: ${r.positionsLeft}, open orders left: ${r.openOrdersLeft}. Account value: ${fmt.n(r.accountValue, 2)}.`);
+      await col.reload();
+    } catch (e) {
+      setLiq(null);
+      setErr(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  };
   const control = async (action: "start" | "stop") => {
     setBusy(true);
     setErr(null);
@@ -109,8 +128,13 @@ export default function Dashboard() {
               </button>
               <label className="flex items-center gap-1 text-sm">
                 <input type="checkbox" checked={paperOn} disabled={s?.running} onChange={(e) => setPaperOn(e.target.checked)} />
-                Paper-trade while collecting (simulated fills only - this app never places a real order)
+                {status.data?.executionMode === "live" ? "Trade LIVE on SIG while collecting (real orders, arbitrage only)" : "Paper-trade while collecting (simulated fills only)"}
               </label>
+              {status.data?.executionMode === "live" && (
+                <button disabled={busy} onClick={liquidate} className="rounded-lg border-2 border-rose-700 bg-white px-4 py-2 text-sm font-semibold text-rose-700 disabled:opacity-40">
+                  Liquidate everything (market)
+                </button>
+              )}
               {status.data?.adminTokenRequired && (
                 <input
                   className="rounded border px-2 py-1 text-sm"
@@ -136,11 +160,19 @@ export default function Dashboard() {
               </div>
             )}
             {s?.lastError && <ErrorBox error={`Last tick error: ${s.lastError}`} />}
+            {liq && <Notice>{liq}</Notice>}
+            {s?.executionMode === "live" && s.live && (
+              <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
+                <Stat label="Secured value (cash + set payouts)" value={fmt.n(s.live.securedValue, 0)} sub={`vs start ${fmt.n(s.live.startValue, 0)}`} tone={(s.live.securedValue ?? 0) >= (s.live.startValue ?? 0) ? undefined : "neg"} />
+                <Stat label="SIG account value (mid-marked)" value={fmt.n(s.live.accountValue, 0)} sub={`cash ${fmt.n(s.live.cash, 0)}`} />
+                <Stat label="Live orders filled / sent" value={`${s.live.ordersFilled}/${s.live.ordersSent}`} sub={`${s.live.errors} errors${s.live.halted ? " - HALTED" : ""}`} />
+              </div>
+            )}
           </div>
         )}
         {status.data && (
           <p className="mt-3 text-xs text-slate-500">
-            Rate limit: {status.data.rateLimits.readsPerMinute} reads per minute per key (read-only, no order writes), used at{" "}
+            Rate limit: {status.data.rateLimits.readsPerMinute} reads{status.data.rateLimits.writesPerMinute ? ` / ${status.data.rateLimits.writesPerMinute} writes` : ""} per minute per key, used at{" "}
             {Math.round(status.data.rateLimits.safety * 100)}% ({status.data.rateLimits.source}). Bulk prices cost ⌈markets/100⌉ reads per poll; the rest of the budget refreshes depth.
           </p>
         )}
