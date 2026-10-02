@@ -404,7 +404,8 @@ export class Collector {
 
   /** Passive unwinds of large sets, every 15 s, after the live trader's own batch has settled. */
   private async passiveTick() {
-    if (!this.tournamentId || !this.portfolio || this.liveFlush) return;
+    // Runs alongside the live trader's batch: the races it works on are excluded from the engine.
+    if (!this.tournamentId || !this.portfolio) return;
     if (!this.passive) this.passive = new PassiveUnwinder(this.client, this.tournamentId, () => this.markets, () => this.portfolio, (id) => this.books.get(id));
     if (Date.now() - this.passiveLast < 15_000) return;
     this.passiveLast = Date.now();
