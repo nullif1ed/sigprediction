@@ -234,13 +234,17 @@ export class LiveTrader {
       const positions = pf.positions();
       left = positions.length;
       if (!left) break;
-      for (const p of positions) {
-        const b = this.getBook(p.marketId);
+      // Books move while SIG answers slowly: price below the walked level, more on each pass.
+      const slack = [0.02, 0.05, 0.1, 0.2][Math.min(pass, 3)];
+      const sellOne = async (p: (typeof positions)[number]) => {
         const ex = exchangeOf.get(p.marketId);
+        if (!ex) return;
+        const fresh = await this.client.orderbook(p.marketId, this.tournamentId, 50).catch(() => null);
+        const b = fresh ?? this.getBook(p.marketId);
+        if (!b) return;
         const action = p.contract === "YES" ? "SELL_YES" : "SELL_NO";
-        if (!b || !ex) continue;
         const levels = contractLevels(b, action);
-        if (!levels.length) continue;
+        if (!levels.length) return;
         let need = p.quantity;
         let limit = levels[0].price;
         for (const lv of levels) {
@@ -248,16 +252,22 @@ export class LiveTrader {
           need -= lv.quantity;
           if (need <= 0) break;
         }
+        limit = Math.max(0.005, limit - slack);
         const qty = Math.floor(Math.min(p.quantity, this.real.get(`${p.marketId}:${p.contract}`) ?? 0));
-        if (qty <= 0) continue;
+        if (qty <= 0) return;
         try {
           const r = await this.client.placeOrder({ exchangeId: ex, side: p.contract === "YES" ? "yes" : "no", action: "sell", quantity: qty, price: onTick(limit, "down"), tournamentId: this.tournamentId, idempotencyKey: `liq-${randomUUID()}` });
           if (r.open && r.orderId) await this.client.cancelOrder(r.orderId).catch(() => undefined);
-          log("WARNING", "live", "liquidate", { marketId: p.marketId, contract: p.contract, quantity: qty, limit, filled: r.quantityTraded, fillPrice: r.fillPrice, costBasis: round(qty * p.avgEntry, 2) });
+          log("WARNING", "live", "liquidate", { pass, marketId: p.marketId, contract: p.contract, quantity: qty, limit: round(limit, 3), freshBook: !!fresh, filled: r.quantityTraded, fillPrice: r.fillPrice, costBasis: round(qty * p.avgEntry, 2) });
         } catch (e) {
           this.fail("liquidate_failed", e, { marketId: p.marketId });
         }
-      }
+      };
+      // SIG takes ~30 s per call: work several positions at once (the write limiter still caps the rate).
+      const todo = [...positions];
+      await Promise.all(Array.from({ length: Math.min(4, todo.length) }, async () => {
+        for (let p = todo.shift(); p; p = todo.shift()) await sellOne(p);
+      }));
     }
     await this.reconcile();
     pf.arb.clear();
