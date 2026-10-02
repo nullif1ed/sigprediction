@@ -48,6 +48,17 @@ export function raceId(r: RaceKey): string {
   return `${r.cycle}:${r.office}:${r.state}${r.district ? "-" + r.district : ""}`;
 }
 
+/** Deterministic 0..1 hash of a race id: stable across restarts, so sampling never flaps a race
+ * in and out from one tick to the next (and a race's legs always land on the same side). */
+export function raceSampleScore(id: string): number {
+  let h = 2166136261; // FNV-1a
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967295;
+}
+
 export function raceLabel(r: RaceKey): string {
   switch (r.office) {
     case "HOUSE_CONTROL":

@@ -13,17 +13,15 @@ export const config = {
   tournamentSlug: process.env.SIG_TOURNAMENT_SLUG ?? "midterm-elections",
 
   // Published per-key limits (API reference, "Rate limits & retries"): standard keys get
-  // 100 reads and 30 writes per minute; 429 responses carry Retry-After: 60.
+  // 100 reads per minute; 429 responses carry Retry-After: 60. Read-only, no writes/orders.
   readsPerMinute: num("SIG_READS_PER_MIN", 100),
-  writesPerMinute: num("SIG_WRITES_PER_MIN", 30),
-  // The budget is per account and shared with the dashboard / Vercel UI / live trader.
   rateSafety: num("SIG_RATE_SAFETY", 0.85),
   requestTimeoutMs: num("SIG_TIMEOUT_MS", 30_000),
 
   /** fast loop: top of book for the "hot" markets (positions, arbitrage races, live signals) */
-  priceIntervalSec: num("PRICE_POLL_SEC", 2),
+  priceIntervalSec: num("PRICE_POLL_SEC", 4),
   /** top of book for the whole universe (ceil(N/100) reads) */
-  universeIntervalSec: num("UNIVERSE_POLL_SEC", 6),
+  universeIntervalSec: num("UNIVERSE_POLL_SEC", 12),
   /** refetch depth of a hot market at least this often */
   hotDepthMaxAgeSec: num("HOT_DEPTH_MAX_AGE_SEC", 10),
   /** parallel depth requests per tick */
@@ -31,6 +29,10 @@ export const config = {
   externalIntervalSec: num("EXTERNAL_POLL_SEC", 90),
   newsMarketsPerMinute: num("NEWS_MARKETS_PER_MIN", 12),
   marketsRefreshSec: num("MARKETS_REFRESH_SEC", 600),
+  /** Trade only a sampled fraction of races (1 = all, 0.5 = half) to cut read/write load when
+   * hitting SIG's rate limit. Sampling is by race, deterministic (hash of the race id), so a
+   * race's legs are always kept or dropped together - never split across the cutoff. */
+  marketSamplePct: Math.min(1, Math.max(0.01, num("MARKET_SAMPLE_PCT", 100) / 100)),
   snapshotHeartbeatSec: num("SNAPSHOT_HEARTBEAT_SEC", 60),
 
   initialBankroll: num("INITIAL_BANKROLL", 100_000),
@@ -40,45 +42,6 @@ export const config = {
   adminToken: process.env.BOT_ADMIN_TOKEN ?? "",
   /** Order books from SIG Realtime (no REST reads); REST is only used to resync. */
   realtime: process.env.REALTIME !== "0",
-  /** REAL orders on SIG. Off unless LIVE_TRADING=1. */
-  get liveTrading() {
-    return process.env.LIVE_TRADING === "1";
-  },
-  /** max notional (SUSQies) of one live order leg */
-  liveMaxOrderNotional: num("LIVE_MAX_ORDER_NOTIONAL", 25_000),
-  /** stop opening new live positions when account value falls this far below its start */
-  liveMaxDrawdown: num("LIVE_MAX_DRAWDOWN", 0.05),
-  /** live entries older than this when their turn to be sent comes are dropped (stale) */
-  liveMaxOrderAgeSec: num("LIVE_MAX_ORDER_AGE_SEC", 20),
-  liveReconcileSec: num("LIVE_RECONCILE_SEC", 30),
-  /** One-time: sell every position at market when live trading starts (runs once per id; "" = off). */
-  liquidateRunId: process.env.LIQUIDATE_RUN_ID ?? "liq-final-shutdown",
-  /** Market-making experiment (live only, directional risk, not guaranteed like arbitrage). Off
-   * by default: set MM_ENABLED=1 to opt in. Runs once per MM_RUN_ID. */
-  mmEnabled: process.env.MM_ENABLED === "1",
-  mmRunId: process.env.MM_RUN_ID ?? "mm-exp-2",
-  mmMarkets: num("MM_MARKETS", 3),
-  mmSize: num("MM_SIZE", 500),
-  mmMaxPos: num("MM_MAX_POS", 2000),
-  mmMinSpread: num("MM_MIN_SPREAD", 0.02),
-  mmMinEdge: num("MM_MIN_EDGE", 0.005),
-  mmMinutes: num("MM_MINUTES", 60),
-  mmRefreshSec: num("MM_REFRESH_SEC", 10),
-  mmWritesReserve: num("MM_WRITES_RESERVE", 8),
-  /** Swing catcher: deep resting orders on liquid markets (live, YOLO). SWING_ENABLED=0 disables. */
-  // Of everything tried, arbitrage is the only strategy with a guaranteed edge (the profit is
-  // locked in by the price gap at entry, not a bet on what price does next). The swing catcher
-  // and market maker are both directional bets with real downside (backtest/live loss cases seen),
-  // so they default OFF; opt in with SWING_ENABLED=1 / MM_ENABLED=1 if you want them running too.
-  swingEnabled: process.env.SWING_ENABLED === "1",
-  swingMarkets: num("SWING_MARKETS", 10),
-  swingDist: num("SWING_DIST", 0.05),
-  swingNotional: num("SWING_NOTIONAL", 4000),
-  swingCapitalPct: num("SWING_CAPITAL_PCT", 0.6),
-  swingHoldMin: num("SWING_HOLD_MIN", 60),
-  swingMaxSpread: num("SWING_MAX_SPREAD", 0.03),
-  swingRefreshSec: num("SWING_REFRESH_SEC", 30),
-  swingWritesReserve: num("SWING_WRITES_RESERVE", 8),
   /** Read-only token for GET /api/export/db (database download for offline backtests). Empty disables it. */
   get exportToken() {
     return process.env.BOT_EXPORT_TOKEN ?? "";

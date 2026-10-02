@@ -6,8 +6,9 @@ import { normalizeBook } from "../core/orderbook";
 import { parseSigTitle } from "../core/races";
 
 // Client for the Super Market API (https://sig.thesuper.market/api/v1/docs).
-// Reads use the read budget; order placement/cancel use a separate write budget. The order
-// methods are not called anywhere yet: execution is still paper only.
+// Read-only: this client only calls GET endpoints (plus two reference lookups that happen to be
+// POST, /realtime/token and /account) and never places or cancels an order. It works with a
+// read-scope API key; no "trade" scope is required or used anywhere in this file.
 
 export class SigApiError extends Error {
   constructor(
@@ -56,32 +57,6 @@ export interface RawNews {
   lastRefresh: string | null;
 }
 
-export interface OrderInput {
-  exchangeId: string;
-  side: "yes" | "no";
-  action: "buy" | "sell";
-  quantity: number;
-  /** limit in side-relative terms on the 0.005 tick; omit for a market order */
-  price?: number;
-  tournamentId?: string;
-  expirationDate?: string;
-}
-
-export interface OrderResult {
-  orderId: number | null;
-  exchangeId: string;
-  open: boolean;
-  remainingQuantity?: number;
-  action?: "buy" | "sell";
-  side?: "yes" | "no";
-  price?: number;
-  quantity?: number;
-  terminalReasonCode?: string | null;
-  quantityTraded: number;
-  totalCost: number;
-  fillPrice: number | null;
-}
-
 export interface TournamentPosition {
   exchangeId: string;
   marketId: string;
@@ -124,8 +99,6 @@ export class SigClient {
   readonly reads: RateLimiter;
   /** Site endpoints (news) are unauthenticated and outside the API key budget; keep them gentle. */
   readonly site: RateLimiter;
-  /** Order placement / cancellation budget (30 writes per minute per account, with safety). */
-  readonly writes: RateLimiter;
   private apiKey: string;
   private base: string;
   private siteBase: string;
@@ -145,7 +118,6 @@ export class SigClient {
     this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.reads = new RateLimiter(Math.floor((o.readsPerMinute ?? config.readsPerMinute) * config.rateSafety), undefined, this.sleep);
     this.site = new RateLimiter(30, undefined, this.sleep);
-    this.writes = new RateLimiter(Math.floor(config.writesPerMinute * 0.7), undefined, this.sleep);
     this.timeoutMs = o.timeoutMs ?? config.requestTimeoutMs;
     this.maxRetries = o.maxRetries ?? 3;
   }
@@ -234,43 +206,15 @@ export class SigClient {
     return this.request<T>(`${this.base}${path}`, { auth: true, limiter: this.reads, ...o });
   }
 
-  /** Writes retry with the SAME idempotency key (inside `body`), so a retry can never double-place. */
-  private write<T>(path: string, method: string, body?: unknown) {
-    return this.request<T>(`${this.base}${path}`, { auth: true, limiter: this.writes, method, body, timeoutMs: Math.max(this.timeoutMs, 60_000), maxRetries: 3 });
-  }
-
-  placeOrder(o: OrderInput & { idempotencyKey: string }) {
-    return this.write<OrderResult>("/orders", "POST", o);
-  }
-
-  placeMultiLeg(legs: OrderInput[], idempotencyKey: string) {
-    return this.write<{ results: { index: number; data: OrderResult }[] }>("/orders/multi-leg", "POST", { legs, idempotencyKey });
-  }
-
-  /** Cancel every open order of ours in one tournament, optionally one market (one write). */
-  cancelAll(tournamentId: string, marketId?: string) {
-    return this.write<{ cancelled: number }>("/orders/cancel-all", "POST", marketId ? { tournamentId, marketId } : { tournamentId });
-  }
-
-  async openOrders(tournamentId: string) {
-    const r = await this.api<{ data: { id: number | string; exchangeId: string; side: string; action: string; quantity: number; priceLimit: number | null; open: boolean }[] }>(
-      `/orders?status=open&limit=100&tournamentId=${encodeURIComponent(tournamentId)}`,
-      { timeoutMs: Math.max(this.timeoutMs, 60_000), maxRetries: 2 },
-    );
-    return r.data ?? [];
-  }
-
-  getOrder(orderId: number | string) {
-    return this.api<{ id: number; quantity: number; open: boolean }>(`/orders/${encodeURIComponent(String(orderId))}`, { timeoutMs: Math.max(this.timeoutMs, 60_000), maxRetries: 2 });
-  }
-
-  /** Short-lived (3 h) Realtime token; counts as one write. */
+  /** Short-lived (3 h) Realtime token: reference data, needs no "trade" scope. */
   realtimeToken() {
-    return this.write<{ token: string; expiresAt: string; supabaseUrl: string; anonKey: string; channels: { user: string } }>("/realtime/token", "POST");
-  }
-
-  cancelOrder(orderId: number | string) {
-    return this.write<{ orderId: number; message: string }>(`/orders/${encodeURIComponent(String(orderId))}`, "DELETE");
+    return this.request<{ token: string; expiresAt: string; supabaseUrl: string; anonKey: string; channels: { user: string } }>(`${this.base}/realtime/token`, {
+      auth: true,
+      limiter: this.reads,
+      method: "POST",
+      timeoutMs: Math.max(this.timeoutMs, 60_000),
+      maxRetries: 3,
+    });
   }
 
   tournamentPositions(slug = config.tournamentSlug) {
