@@ -31,9 +31,23 @@ async function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Prom
   return p;
 }
 
+// On the bot host the collector already holds every market and book (Realtime-fed). Serve the
+// dashboard from that memory so page views spend NONE of the per-account SIG read budget.
+interface LocalCollector {
+  running: boolean;
+  markets: SigMarket[];
+  books: Map<string, YesBook>;
+}
+function local(): LocalCollector | null {
+  const c = (globalThis as unknown as { __collector?: LocalCollector }).__collector;
+  return c?.running && c.markets.length && c.books.size ? c : null;
+}
+
 export const getTournament = () => cached<Tournament>("tournament", 3_600_000, () => sigClient().tournament());
 
 export async function getMarkets(): Promise<SigMarket[]> {
+  const l = local();
+  if (l) return l.markets;
   return cached("markets", config.marketsRefreshSec * 1000, async () => {
     const t = await getTournament();
     return (await sigClient().listMarkets(t.id)).filter((m) => !m.isComposite && m.exchanges.length === 1).map(toSigMarket);
@@ -41,6 +55,18 @@ export async function getMarkets(): Promise<SigMarket[]> {
 }
 
 export async function getPrices(markets: SigMarket[]): Promise<Map<string, PriceSnapshot>> {
+  const l = local();
+  if (l) {
+    const out = new Map<string, PriceSnapshot>();
+    for (const m of markets) {
+      const b = l.books.get(m.id);
+      if (!b) continue;
+      const bid = b.bids[0]?.price ?? null;
+      const ask = b.asks[0]?.price ?? null;
+      out.set(m.id, { exchangeId: m.exchangeId, marketId: m.id, option: "YES", latestPrice: m.latestPrice, bestBid: bid, bestAsk: ask, spread: bid !== null && ask !== null ? ask - bid : null });
+    }
+    return out;
+  }
   return cached("prices", 10_000, async () => {
     const t = await getTournament();
     const ps = await sigClient().prices(markets.map((m) => m.exchangeId), t.id);
@@ -49,6 +75,8 @@ export async function getPrices(markets: SigMarket[]): Promise<Map<string, Price
 }
 
 export async function getDepth(marketId: string, ttlMs = 20_000): Promise<YesBook | null> {
+  const l = local();
+  if (l) return l.books.get(marketId) ?? null;
   return cached(`depth:${marketId}`, ttlMs, async () => {
     const t = await getTournament();
     return sigClient().orderbook(marketId, t.id, 50);

@@ -19,7 +19,7 @@ export async function GET() {
     tournament: config.tournamentSlug,
     rateLimits: { readsPerMinute: config.readsPerMinute, writesPerMinute: config.writesPerMinute, safety: config.rateSafety, source: "Super Market API reference: standard keys 100 reads + 30 writes per minute; 429 Retry-After 60" },
     polling: { priceIntervalSec: config.priceIntervalSec, externalIntervalSec: config.externalIntervalSec, newsMarketsPerMinute: config.newsMarketsPerMinute },
-    executionMode: "paper",
+    executionMode: config.liveTrading ? "live" : "paper",
     adminTokenRequired: Boolean(config.adminToken),
     collector,
     data,

@@ -21,6 +21,7 @@ export interface OrderRequest {
   limitPrice?: number | null;
   expiresInSec?: number | null;
   tag?: string;
+  group?: string;
   meta?: OpenMeta;
 }
 
@@ -29,6 +30,7 @@ export interface ExecutionEvents {
   onOrder?: (o: PaperOrder) => void;
 }
 
+const buyAction = (a: Action) => a.startsWith("BUY");
 let seq = 0;
 const newId = () => `paper-${Date.now().toString(36)}-${(++seq).toString(36)}`;
 
@@ -90,6 +92,14 @@ export class PaperExecutionClient implements ExecutionClient {
     }
   }
 
+  /**
+   * Live trading: our real fills are removed from the REAL book, so the simulated consumption
+   * overlay must not subtract them a second time. Called after every reconcile.
+   */
+  resetConsumption() {
+    this.used.clear();
+  }
+
   book(marketId: string): YesBook | undefined {
     return this.books.get(marketId);
   }
@@ -113,6 +123,8 @@ export class PaperExecutionClient implements ExecutionClient {
       expiresAt: req.expiresInSec ? new Date(this.now().getTime() + req.expiresInSec * 1000).toISOString() : null,
       notes: "",
       tag: req.tag,
+      group: req.group,
+      worstPrice: null,
     };
     this.orders.set(o.orderId, o);
     (o as PaperOrder & { meta?: OpenMeta }).meta = req.meta;
@@ -150,6 +162,7 @@ export class PaperExecutionClient implements ExecutionClient {
     o.filledQuantity += ex.filled;
     o.fillPrice = round((prevNotional + ex.vwap * ex.filled) / o.filledQuantity);
     o.fees = round(o.fees + fee, 4);
+    if (ex.worstPrice !== null) o.worstPrice = buyAction(o.action) ? Math.max(o.worstPrice ?? 0, ex.worstPrice) : Math.min(o.worstPrice ?? 1, ex.worstPrice);
     o.status = o.filledQuantity >= o.requestedQuantity ? "filled" : "partially_filled";
     o.updatedAt = ts;
     if (ex.levelsUsed > 1) o.notes = `walked ${ex.levelsUsed} levels, slippage ${ex.slippage.toFixed(4)}`;

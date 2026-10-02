@@ -15,7 +15,9 @@ export interface RiskConfig {
   maxArbitragePct: number; // max total cost basis in arbitrage sets / equity
   maxArbRacePct: number; // max arbitrage cost basis per race / equity
   cashReservePct: number; // cash always kept free for exits and regular trades
-  minArbReturn: number; // min expected return on capital per funded tranche
+  minArbReturn: number; // min expected return on capital per funded tranche (with no capital used)
+  /** extra required return per unit of equity already locked in arbitrage (keeps capital for better sets) */
+  minArbReturnPerUtil: number;
   allowConditionalArb: boolean; // buy-all-YES sets that fail if an unlisted party wins
   minConvergence: number; // min P(listed party wins) for a conditional set
   arbUnwind: boolean; // sell a held set back early once most of its locked profit is executable
@@ -34,14 +36,15 @@ export const DEFAULT_RISK: RiskConfig = {
   maxDrawdown: 0.2,
   minQuantity: 10,
   headlineMultiplier: 1.5,
-  maxArbitragePct: 0.9,
-  maxArbRacePct: 0.5,
-  cashReservePct: 0.02,
-  minArbReturn: 0.005,
+  maxArbitragePct: 0.98,
+  maxArbRacePct: 0.3,
+  cashReservePct: 0.01,
+  minArbReturn: 0.003,
+  minArbReturnPerUtil: 0.01,
   allowConditionalArb: false,
   minConvergence: 0.97,
   arbUnwind: true,
-  arbUnwindCapture: 0.6,
+  arbUnwindCapture: 0.2,
   arbUnwindMinPp: 0.002,
 };
 

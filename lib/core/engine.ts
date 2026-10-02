@@ -48,6 +48,8 @@ export interface StrategyConfig {
    * The regular exits (take profit / mean reversion) then sell it back.
    */
   snipe: boolean;
+  /** directional (regular + headline) entries; arbitrage always runs when `arbitrage` is on */
+  regularTrading: boolean;
   snipeEdge: number;
   snipeMinConfidence: number;
   /** "auto" picks a sizing strategy per scenario using backtest-learned rules */
@@ -73,7 +75,8 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   minEdgeToSpread: 0,
   reentryCooldownMinutes: 30,
   addOnlyWhenProfitable: true,
-  snipe: true,
+  snipe: false,
+  regularTrading: false,
   snipeEdge: 0.03,
   snipeMinConfidence: 0.5,
   sizing: "auto",
@@ -318,6 +321,57 @@ export function runPortfolioTick(args: {
     });
   };
 
+  // 2. Arbitrage leg repair. A set only locks in profit while every leg holds the same quantity.
+  // Live, one leg can fill less than another (or a late fill lands), leaving a naked leg. Complete
+  // the set when that is still profitable; otherwise sell the excess (limit-protected).
+  {
+    const byRace = new Map<string, { marketId: string; contract: "YES" | "NO"; q: number; avg: number }[]>();
+    for (const [k, v] of portfolio.arb) {
+      const [marketId, contract] = k.split(":") as [string, "YES" | "NO"];
+      const q = portfolio.arbQty(marketId, contract);
+      if (q <= 0) continue;
+      const mk = titles.get(marketId);
+      const r = mk?.race ? raceId(mk.race) : portfolio.raceOf(marketId);
+      byRace.set(r, [...(byRace.get(r) ?? []), { marketId, contract, q, avg: v.cost / Math.max(1, v.quantity) }]);
+    }
+    for (const [race, legs] of byRace) {
+      const setIds = portfolio.arbSets.get(race) ?? legs.map((l) => l.marketId);
+      const contract = legs[0].contract;
+      if (legs.some((l) => l.contract !== contract)) continue;
+      const all = setIds.map((id) => legs.find((l) => l.marketId === id) ?? { marketId: id, contract, q: 0, avg: 0 });
+      const hi = Math.max(...all.map((l) => l.q));
+      const lo = Math.min(...all.map((l) => l.q));
+      if (hi - lo < 1) continue;
+      const payout = contract === "NO" ? all.length - 1 : 1;
+      const buy = (contract === "NO" ? "BUY_NO" : "BUY_YES") as Action;
+      const sell = (contract === "NO" ? "SELL_NO" : "SELL_YES") as Action;
+      // Cost per completed set if the short legs are bought at the current touch.
+      const short = all.filter((l) => l.q < hi);
+      const touch = (id: string) => contractLevels(exec.book(id) ?? { exchangeId: "", marketId: id, bids: [], asks: [], asOf: "" }, buy)[0]?.price;
+      const completeCost = all.reduce((sum, l) => sum + (l.q >= hi ? l.avg : (touch(l.marketId) ?? 9)), 0);
+      const group = `repair:${race}:${ts}`;
+      if (completeCost <= payout - 0.002) {
+        for (const l of short) {
+          const qty = hi - l.q;
+          const px = touch(l.marketId)!;
+          const o = exec.submitOrder({ marketId: l.marketId, action: buy, quantity: qty, orderType: "market", limitPrice: px, tag: "arbitrage:repair:complete", group, meta: { tradeType: "arbitrage" } });
+          portfolio.markArb(l.marketId, contract, o.filledQuantity, o.filledQuantity * (o.fillPrice ?? 0));
+        }
+        out.logs.push({ level: "WARNING", message: `ARB repair ${race}: completed short legs to ${hi} sets (cost/set ${completeCost.toFixed(4)})`, context: { raceId: race } });
+      } else {
+        for (const l of all.filter((x) => x.q > lo)) {
+          const qty = l.q - lo;
+          const bk = exec.book(l.marketId);
+          const best = bk ? contractLevels(bk, sell)[0]?.price : undefined;
+          if (best === undefined) continue;
+          const o = exec.submitOrder({ marketId: l.marketId, action: sell, quantity: qty, orderType: "market", limitPrice: round(Math.max(0.005, best - cfg.exits.maxExitSlippagePp), 4), tag: "arbexit:repair", group });
+          portfolio.markArb(l.marketId, contract, -o.filledQuantity, 0);
+        }
+        out.logs.push({ level: "WARNING", message: `ARB repair ${race}: sold excess legs down to ${lo} sets`, context: { raceId: race } });
+      }
+    }
+  }
+
   // 2a. Arbitrage unwind: a held set can often be sold back for most of its locked profit long
   // before settlement. Realising it frees the capital for the next set (other bots keep re-opening
   // the same spreads), and protects the gain if the set is still open at the tournament end.
@@ -340,20 +394,23 @@ export function runPortfolioTick(args: {
       }));
       if (legs.some((l) => !l.book)) continue;
       const costPerSet = held.reduce((sum, h) => sum + portfolio.arbCost(h.marketId, h.contract) / Math.max(1, portfolio.arb.get(`${h.marketId}:${h.contract}`)?.quantity ?? 1), 0);
-      const payout = held[0].contract === "NO" ? held.length - 1 : 1;
+      const setSize = portfolio.arbSets.get(race)?.length ?? held.length;
+      if (held.length < setSize) continue; // a leg is missing: the repair step handles it
+      const payout = held[0].contract === "NO" ? setSize - 1 : 1;
       const locked = payout - costPerSet;
       const need = costPerSet + Math.max(cfg.risk.arbUnwindMinPp, cfg.risk.arbUnwindCapture * locked);
       const u = sizeUnwind(legs, need);
-      if (!u || u.q < cfg.risk.minQuantity) continue;
+      if (!u || u.q < Math.min(cfg.risk.minQuantity, Math.min(...legs.map((l) => l.held)))) continue;
+      const group = `unwind:${race}:${ts}`;
       for (const leg of u.legs) {
         const contract = leg.action.endsWith("YES") ? "YES" : "NO";
-        const o = exec.submitOrder({ marketId: leg.marketId, action: leg.action, quantity: u.q, orderType: "market", limitPrice: leg.limit, tag: "arbexit:unwind" });
+        const o = exec.submitOrder({ marketId: leg.marketId, action: leg.action, quantity: u.q, orderType: "market", limitPrice: leg.limit, tag: "arbexit:unwind", group });
         portfolio.markArb(leg.marketId, contract, -o.filledQuantity, 0);
         out.exits.push({ marketId: leg.marketId, contract, reason: "arb_unwind", quantity: o.filledQuantity, price: o.fillPrice });
       }
       out.logs.push({
         level: "INFO",
-        message: `ARB unwind ${race}: sold ${u.q} sets at ${(u.proceeds / u.q).toFixed(4)} (cost ${costPerSet.toFixed(4)}, payout ${payout})`,
+        message: `ARB unwind ${race}: sold ${u.q} of ${Math.min(...legs.map((l) => l.held))} sets at ${(u.proceeds / u.q).toFixed(4)} (cost ${costPerSet.toFixed(4)}, payout ${payout}, profit ${((u.proceeds / u.q - costPerSet) * u.q).toFixed(2)})`,
         context: { raceId: race, profit: round((u.proceeds / u.q - costPerSet) * u.q, 2) },
       });
     }
@@ -399,7 +456,7 @@ export function runPortfolioTick(args: {
         return view.equity * cfg.risk.maxArbRacePct - (leg ? portfolio.raceArbExposure(leg) : 0);
       },
       minQuantity: cfg.risk.minQuantity,
-      minReturn: cfg.risk.minArbReturn,
+      minReturn: cfg.risk.minArbReturn + cfg.risk.minArbReturnPerUtil * (view.equity > 0 ? portfolio.arbExposure() / view.equity : 0),
     });
     for (const al of allocations) {
       const a = al.arb;
@@ -425,6 +482,8 @@ export function runPortfolioTick(args: {
           if (left <= 0) break;
         }
       }
+      const group = `arb:${a.raceId}:${ts}`;
+      portfolio.arbSets.set(a.raceId, [...new Set([...(portfolio.arbSets.get(a.raceId) ?? []), ...live.legs.map((l) => l.marketId)])]);
       for (const leg of live.legs) {
         const d: Decision = {
           marketId: leg.marketId,
@@ -469,6 +528,7 @@ export function runPortfolioTick(args: {
           orderType: "market",
           limitPrice: worst.get(leg.marketId) ?? null,
           tag: `arbitrage:arbitrage:${a.kind}`,
+          group,
           meta: { tradeType: "arbitrage" },
         });
         portfolio.markArb(leg.marketId, d.contract, o.filledQuantity, o.filledQuantity * (o.fillPrice ?? 0));
@@ -479,7 +539,7 @@ export function runPortfolioTick(args: {
   }
 
   // 3. Headline trades (time sensitive).
-  for (const h of signals.headlines) {
+  for (const h of cfg.regularTrading ? signals.headlines : []) {
     const key = `${h.marketId}:${h.headline.id}`;
     if (args.tradedHeadlines.has(key)) continue;
     const base = signals.fair.get(h.marketId);
@@ -525,7 +585,7 @@ export function runPortfolioTick(args: {
 
   // 4. Regular opportunities across the whole universe.
   const all: Opportunity[] = [];
-  for (const m of state.markets) {
+  for (const m of cfg.regularTrading ? state.markets : []) {
     const f = signals.fair.get(m.id);
     const book = exec.book(m.id);
     if (!f || !book) continue;
