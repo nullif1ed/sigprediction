@@ -395,7 +395,7 @@ export class Collector {
       if (!this.live) {
         // The simulator keeps our consumed liquidity until a newer book shows that level changed,
         // so a stale book can never make the engine re-buy depth we already took for real.
-        this.live = new LiveTrader(this.client, this.tournamentId, () => this.markets, () => this.portfolio);
+        this.live = new LiveTrader(this.client, this.tournamentId, () => this.markets, () => this.portfolio, undefined, () => !this.strategy.regularTrading);
       }
       await this.live.reconcile(true);
       this.liveReady = true;
