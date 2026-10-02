@@ -34,7 +34,7 @@ function fakeSig(fill: (leg: { exchangeId: string; quantity: number; price: numb
     if (path === "/orders/cancel-all") return json({ cancelled: 1 });
     if (init?.method === "DELETE" && path.startsWith("/orders/")) return json({ orderId: 1, message: "cancelled" });
     if (path.endsWith("/portfolio/positions"))
-      return json({ positions: [...held].filter(([, q]) => q !== 0).map(([exchangeId, q]) => ({ exchangeId, marketId: exchangeId === "1070" ? "381" : "382", marketTitle: "", settled: false, quantity: q, avgCost: 0.5, currentPrice: 0.5, marketValue: 0, costBasis: 0, lots: [] })), summary: {} });
+      return json({ positions: [...held].filter(([, q]) => q !== 0).map(([exchangeId, q]) => ({ exchangeId, marketId: exchangeId === "1070" ? "381" : "382", marketTitle: "", settled: false, quantity: q, avgCost: 0.5, currentPrice: 0.9, marketValue: Math.abs(q) * 0.1, costBasis: 0, lots: [] })), summary: {} });
     if (path.endsWith("/portfolio/pnl")) {
       const holdings = [...held.values()].reduce((s, q) => s + Math.abs(q) * 0.5, 0);
       return json({ totalAccountValue: cash + holdings, totalHoldingsValue: holdings, totalCostBasis: 0, unrealizedPnl: 0, roi: 0 });
@@ -171,8 +171,9 @@ describe("reconcile", () => {
     expect(t.pf.arbQty("381", "NO")).toBe(300);
     expect(t.pf.arbQty("382", "NO")).toBe(420);
     expect(t.pf.arbSets.get("2026:SENATE:NH")).toEqual(["381", "382"]);
-    // Secured value counts the 300 complete sets at their payout (1 each), not at SIG's mid.
-    expect(t.live.stats.securedValue).toBeGreaterThan(0);
+    // Secured = cash + 300 complete sets x 1 + 120 excess NO at SIG's per-share value (0.10, not
+    // the 0.90 YES price).
+    expect(t.live.stats.securedValue).toBeCloseTo((t.live.stats.cash ?? 0) + 300 + 120 * 0.1, 2);
   });
 });
 

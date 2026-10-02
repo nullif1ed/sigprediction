@@ -134,7 +134,9 @@ export class LiveTrader {
     // SIG values NO shares near the mid, so a freshly bought set always "shows" a loss although its
     // payout is fixed. Judge drawdown on secured value: cash + guaranteed payout of complete sets +
     // market value of everything else.
-    const price = new Map(pos.positions.map((p) => [`${byExchange.get(String(p.exchangeId)) ?? p.marketId}:${p.quantity > 0 ? "YES" : "NO"}`, p.currentPrice ?? p.avgCost]));
+    // Per-share value of what is held, from SIG's own marketValue (currentPrice is the YES price,
+    // which would overvalue NO shares).
+    const price = new Map(pos.positions.map((p) => [`${byExchange.get(String(p.exchangeId)) ?? p.marketId}:${p.quantity > 0 ? "YES" : "NO"}`, p.quantity ? Math.abs(p.marketValue / p.quantity) : p.avgCost]));
     let secured = cash;
     const counted = new Map<string, number>();
     for (const [race, ids] of pf.arbSets) {
