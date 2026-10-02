@@ -302,7 +302,7 @@ export class SigClient {
       const q = new URLSearchParams({ limit: "100", status: "open" });
       if (tournamentId) q.set("tournamentId", tournamentId);
       if (cursor) q.set("cursor", cursor);
-      const r = await this.api<{ data: RawMarket[]; pagination: { hasMore: boolean; nextCursor: string | null } }>(`/markets?${q}`);
+      const r = await this.api<{ data: RawMarket[]; pagination: { hasMore: boolean; nextCursor: string | null } }>(`/markets?${q}`, { timeoutMs: Math.max(this.timeoutMs, 60_000) });
       out.push(...r.data);
       if (!r.pagination?.hasMore || !r.pagination.nextCursor) break;
       cursor = r.pagination.nextCursor;
