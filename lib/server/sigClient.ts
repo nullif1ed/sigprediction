@@ -236,7 +236,7 @@ export class SigClient {
 
   /** Writes retry with the SAME idempotency key (inside `body`), so a retry can never double-place. */
   private write<T>(path: string, method: string, body?: unknown) {
-    return this.request<T>(`${this.base}${path}`, { auth: true, limiter: this.writes, method, body, timeoutMs: Math.max(this.timeoutMs, 20_000), maxRetries: 3 });
+    return this.request<T>(`${this.base}${path}`, { auth: true, limiter: this.writes, method, body, timeoutMs: Math.max(this.timeoutMs, 60_000), maxRetries: 3 });
   }
 
   placeOrder(o: OrderInput & { idempotencyKey: string }) {
@@ -255,13 +255,13 @@ export class SigClient {
   async openOrders(tournamentId: string) {
     const r = await this.api<{ data: { id: number | string; exchangeId: string; side: string; action: string; quantity: number; priceLimit: number | null; open: boolean }[] }>(
       `/orders?status=open&limit=100&tournamentId=${encodeURIComponent(tournamentId)}`,
-      { timeoutMs: Math.max(this.timeoutMs, 15_000), maxRetries: 1 },
+      { timeoutMs: Math.max(this.timeoutMs, 60_000), maxRetries: 2 },
     );
     return r.data ?? [];
   }
 
   getOrder(orderId: number | string) {
-    return this.api<{ id: number; quantity: number; open: boolean }>(`/orders/${encodeURIComponent(String(orderId))}`, { timeoutMs: Math.max(this.timeoutMs, 15_000), maxRetries: 1 });
+    return this.api<{ id: number; quantity: number; open: boolean }>(`/orders/${encodeURIComponent(String(orderId))}`, { timeoutMs: Math.max(this.timeoutMs, 60_000), maxRetries: 2 });
   }
 
   /** Short-lived (3 h) Realtime token; counts as one write. */
@@ -276,14 +276,14 @@ export class SigClient {
   tournamentPositions(slug = config.tournamentSlug) {
     return this.api<{ positions: TournamentPosition[]; summary: { totalMarketValue: number; totalCostBasis: number } }>(
       `/tournaments/${encodeURIComponent(slug)}/portfolio/positions`,
-      { timeoutMs: Math.max(this.timeoutMs, 15_000), maxRetries: 2 },
+      { timeoutMs: Math.max(this.timeoutMs, 60_000), maxRetries: 3 },
     );
   }
 
   tournamentPnl(slug = config.tournamentSlug) {
     return this.api<{ totalAccountValue: number; totalHoldingsValue: number; totalCostBasis: number; unrealizedPnl: number; roi: number | null }>(
       `/tournaments/${encodeURIComponent(slug)}/portfolio/pnl?period=all`,
-      { timeoutMs: Math.max(this.timeoutMs, 15_000), maxRetries: 2 },
+      { timeoutMs: Math.max(this.timeoutMs, 60_000), maxRetries: 3 },
     );
   }
 
@@ -331,7 +331,7 @@ export class SigClient {
     if (tournamentId) q.set("tournamentId", tournamentId);
     const r = await this.api<{
       exchanges: { exchangeId: string; asOf: { sequence: number; at: string } | null; bids: Level[]; asks: Level[] }[];
-    }>(`/markets/${encodeURIComponent(marketId)}/orderbook?${q}`, { timeoutMs: Math.min(this.timeoutMs, 10_000), maxRetries: 0 });
+    }>(`/markets/${encodeURIComponent(marketId)}/orderbook?${q}`, { timeoutMs: Math.min(this.timeoutMs, 25_000), maxRetries: 0 });
     const ex = r.exchanges?.[0];
     if (!ex) return null;
     return normalizeBook({
