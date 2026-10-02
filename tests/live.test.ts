@@ -239,3 +239,18 @@ describe("live position hygiene (2 Oct account)", () => {
     expect(pf.holdings("381").NO).toBe(0);
   });
 });
+
+describe("no accumulation into unbalanced sets", () => {
+  it("does not add a new clip to a race whose legs are unequal", async () => {
+    const t = setup((l) => (l.exchangeId === "1071" ? 200 : l.quantity));
+    await t.live.reconcile(true);
+    t.tick(arbBooks());
+    await t.live.flush(); // 500 vs 200
+    const before = t.calls.filter((c) => c.path === "/orders/multi-leg").length;
+    // Fresh book with the same spread: the engine must repair, not open another set.
+    const r = t.tick(new Map([["381", book("381", [[0.6, 9000]], [[0.62, 500]])], ["382", book("382", [[0.45, 9000]], [[0.47, 500]])]]));
+    expect(r.decisions.filter((d) => d.opportunityType === "arbitrage" && d.marketId === "381")).toHaveLength(0);
+    expect(r.logs.some((l) => /ARB repair/.test(l.message))).toBe(true);
+    void before;
+  });
+});

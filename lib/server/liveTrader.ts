@@ -202,6 +202,13 @@ export class LiveTrader {
     try {
       const pending = this.queue.splice(0);
       this.stats.queue = 0;
+      // Entries decided on an older book than the newest batch are superseded: drop them.
+      const newest = Math.max(0, ...pending.filter((p) => !isExit(p.o)).map((p) => p.queuedAt));
+      for (let i = pending.length - 1; i >= 0; i--)
+        if (!isExit(pending[i].o) && pending[i].queuedAt < newest - 1000) {
+          pending.splice(i, 1);
+          this.stats.dropped++;
+        }
       if (pending.length) {
         // Group legs of the same set; exits/unwinds/repairs first, then entries in queue order.
         const groups = new Map<string, Pending[]>();
@@ -270,6 +277,12 @@ export class LiveTrader {
         ? (await this.client.placeMultiLeg(legs.map((l) => l.input), key)).results.sort((a, b) => a.index - b.index).map((r) => r.data)
         : [await this.client.placeOrder({ ...legs[0].input, idempotencyKey: key })];
     } catch (e) {
+      // 409 REQUEST_IN_FLIGHT: SIG is still executing it; the outcome arrives via reconcile.
+      if (e instanceof SigApiError && e.status === 409) {
+        this.lastReconcile = 0;
+        log("WARNING", "live", "order_in_flight", { legs: legs.map((l) => l.input) });
+        return true;
+      }
       this.fail("order_failed", e, { legs: legs.map((l) => l.input) });
       return false;
     }

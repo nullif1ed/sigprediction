@@ -20,6 +20,8 @@ export interface RiskConfig {
   minArbReturnPerUtil: number;
   allowConditionalArb: boolean; // buy-all-YES sets that fail if an unlisted party wins
   minConvergence: number; // min P(listed party wins) for a conditional set
+  /** max cost of one new arbitrage clip (all legs) per race per tick: big clips fill unevenly live */
+  maxArbClipNotional: number;
   arbUnwind: boolean; // sell a held set back early once most of its locked profit is executable
   arbUnwindCapture: number; // fraction of the locked profit per set that must be executable
   arbUnwindMinPp: number; // and at least this much profit per set (probability points)
@@ -43,6 +45,7 @@ export const DEFAULT_RISK: RiskConfig = {
   minArbReturnPerUtil: 0.01,
   allowConditionalArb: false,
   minConvergence: 0.97,
+  maxArbClipNotional: 15000,
   arbUnwind: true,
   arbUnwindCapture: 0.1,
   arbUnwindMinPp: 0.002,
