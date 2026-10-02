@@ -254,3 +254,18 @@ describe("no accumulation into unbalanced sets", () => {
     void before;
   });
 });
+
+describe("repair orders never overshoot", () => {
+  it("clips stacked repairs to the real imbalance", async () => {
+    const t = setup((l) => l.quantity);
+    t.held.set("1070", -1000);
+    t.held.set("1071", -700);
+    await t.live.reconcile(true);
+    const rep = (q: number, n: number) => ({ orderId: `r${n}`, marketId: "382", action: "BUY_NO", contract: "NO", orderType: "market", limitPrice: 0.55, requestedQuantity: q, filledQuantity: q, fillPrice: 0.55, fees: 0, status: "filled", createdAt: "", updatedAt: "", expiresAt: null, notes: "", tag: "arbitrage:repair:complete", group: `repair:${n}`, worstPrice: 0.55 }) as PaperOrder;
+    t.live.capture(rep(300, 1));
+    t.live.capture(rep(300, 2)); // same repair decided again on the next tick
+    t.live.capture(rep(900, 3)); // and an oversized one
+    await t.live.flush();
+    expect(Math.abs(t.held.get("1071")!)).toBe(1000);
+  });
+});

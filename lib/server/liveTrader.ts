@@ -154,6 +154,16 @@ export class LiveTrader {
     this.onReconciled();
   }
 
+  private raceOf(marketId: string): string {
+    const m = this.markets().find((x) => x.id === marketId);
+    return m?.race ? raceId(m.race) : marketId;
+  }
+
+  private raceLegs(marketId: string): string[] {
+    const r = this.raceOf(marketId);
+    return this.markets().filter((m) => m.race && raceId(m.race) === r).map((m) => m.id);
+  }
+
   /**
    * Positions held as a complete set (NO on every listed outcome of a race, or YES on every one)
    * are arbitrage even if local records were lost (restart, manual trades): lock them as a set.
@@ -216,6 +226,13 @@ export class LiveTrader {
           const k = p.o.group ?? p.o.orderId;
           groups.set(k, [...(groups.get(k) ?? []), p]);
         }
+        // Repairs re-decided on later ticks supersede earlier ones for the same race.
+        const latestRepair = new Map<string, string>();
+        for (const [k, g] of groups) if (/:repair/.test(g[0].o.tag ?? "")) latestRepair.set(this.raceOf(g[0].o.marketId), k);
+        for (const [k, g] of [...groups]) if (/:repair/.test(g[0].o.tag ?? "") && latestRepair.get(this.raceOf(g[0].o.marketId)) !== k) {
+          groups.delete(k);
+          this.stats.dropped += g.length;
+        }
         const ordered = [...groups.values()].sort((a, b) => Number(!a.some((x) => isExit(x.o))) - Number(!b.some((x) => isExit(x.o))));
         for (const g of ordered) {
           const exit = g.some((x) => isExit(x.o));
@@ -258,6 +275,12 @@ export class LiveTrader {
       const price = onTick(px, buy ? "up" : "down");
       let qty = Math.floor(o.filledQuantity);
       if (!buy) qty = Math.min(qty, Math.floor(this.real.get(`${o.marketId}:${contract}`) ?? 0));
+      if (/:repair/.test(o.tag ?? "")) {
+        // A repair may only close the imbalance that REALLY exists right now.
+        const legs = this.raceLegs(o.marketId).map((id) => this.real.get(`${id}:${contract}`) ?? 0);
+        const mine = this.real.get(`${o.marketId}:${contract}`) ?? 0;
+        qty = Math.min(qty, Math.floor(buy ? Math.max(...legs) - mine : mine - Math.min(...legs)));
+      }
       qty = Math.min(qty, Math.floor(config.liveMaxOrderNotional / Math.max(price, 0.005)));
       const exchangeId = exchangeOf.get(o.marketId);
       if (!exchangeId || qty <= 0) continue;
@@ -265,7 +288,7 @@ export class LiveTrader {
     }
     if (!legs.length) return false;
     // A set's legs must stay equal: size every leg to the smallest.
-    if (legs.length > 1) {
+    if (legs.length > 1 && !/:repair/.test(legs[0].o.tag ?? "")) {
       const q = Math.min(...legs.map((l) => l.input.quantity));
       for (const l of legs) l.input.quantity = q;
     }
