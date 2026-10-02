@@ -204,9 +204,13 @@ export class SwingCatcher {
       const t = this.top(id);
       const real = Math.floor(this.held(id, p.contract));
       if (real < 1) {
-        // Sold elsewhere (or never really held): forget it.
-        this.pos.delete(id);
-        this.save();
+        // The portfolio only shows a fill after the next reconcile (30-60 s on slow SIG): never
+        // forget a fresh fill. Only a position missing for 10+ minutes was really sold elsewhere.
+        if (Date.now() - p.at > 10 * 60_000) {
+          this.pos.delete(id);
+          this.save();
+          log("WARNING", "swing", "position_gone", { marketId: id, contract: p.contract, qty: p.qty });
+        }
         continue;
       }
       if (!m || !t) continue;
