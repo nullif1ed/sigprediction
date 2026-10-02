@@ -21,6 +21,7 @@ import { Portfolio } from "../core/portfolio";
 import { PaperExecutionClient } from "../core/execution";
 import { RealtimeBooks, type RealtimeStats } from "./realtime";
 import { LiveTrader, type LiveStats } from "./liveTrader";
+import { SwingCatcher, type SwingStats } from "./swingCatcher";
 import { MarketMaker, type MMStats } from "./marketMaker";
 import { PassiveUnwinder, type PassiveStats } from "./passiveUnwind";
 import { raceId } from "../core/races";
@@ -51,6 +52,7 @@ export interface CollectorStatus {
   live: LiveStats | null;
   mm: MMStats | null;
   passive: PassiveStats | null;
+  swing: SwingStats | null;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -95,6 +97,8 @@ export class Collector {
   passive: PassiveUnwinder | null = null;
   private passiveLast = 0;
   private mmBusy: Promise<void> | null = null;
+  swing: SwingCatcher | null = null;
+  private swingLast = 0;
   private mmLast = 0;
   private lastFair = new Map<string, { p: number; confidence: number }>();
   private rtRestarts = 0;
@@ -135,6 +139,7 @@ export class Collector {
       live: this.live?.stats ?? null,
       mm: this.mm?.stats ?? kvGet<MMStats | null>("mm_experiment", null),
       passive: this.passive?.stats ?? null,
+      swing: this.swing?.stats ?? kvGet<SwingStats | null>("swing_stats", null),
     };
   }
 
@@ -362,6 +367,7 @@ export class Collector {
         this.mmBusy = (async () => {
           await this.passiveTick();
           await this.mmTick();
+          await this.swingTick();
         })().finally(() => (this.mmBusy = null));
     }
 
@@ -427,7 +433,7 @@ export class Collector {
 
   /** Markets owned by the market maker or a resting passive unwind: the engine leaves them alone. */
   private ownedMarkets(): Set<string> {
-    return new Set([...(this.mm?.skip() ?? []), ...(this.passive?.owned() ?? [])]);
+    return new Set([...(this.mm?.skip() ?? []), ...(this.passive?.owned() ?? []), ...(this.swing?.owned() ?? [])]);
   }
 
   /** Passive unwinds of large sets, every 15 s, after the live trader's own batch has settled. */
@@ -441,6 +447,15 @@ export class Collector {
   }
 
   /** Market-making experiment: start once per MM_RUN_ID, then refresh quotes every MM_REFRESH_SEC. */
+  /** Deep resting orders (YOLO companion), every SWING_REFRESH_SEC after the live batch. */
+  private async swingTick() {
+    if (!this.swing || !this.tournamentId || !this.portfolio) return;
+    if (Date.now() - this.swingLast < config.swingRefreshSec * 1000) return;
+    this.swingLast = Date.now();
+    await this.swing.cycle();
+    this.portfolio.reservedCash = this.swing.reserved();
+  }
+
   private async mmTick() {
     if (!config.mmEnabled || !this.tournamentId || !this.portfolio || this.strategy.yolo) return;
     if (!this.mm) {
@@ -484,6 +499,26 @@ export class Collector {
   private async initLive() {
     if (!this.tournamentId || !this.markets.length) return;
     try {
+      if (!this.swing && config.swingEnabled && this.strategy.yolo) {
+        // Before the first reconcile: markets holding swing fills must not be adopted as arbitrage.
+        this.swing = new SwingCatcher(
+          this.client,
+          this.tournamentId,
+          () => this.markets,
+          (id) => this.books.get(id),
+          () => {
+            const r = new Set(this.portfolio?.arbSets.keys() ?? []);
+            for (const p of this.portfolio?.positions() ?? []) {
+              if (this.swing?.owned().has(p.marketId)) continue;
+              const m = this.markets.find((x) => x.id === p.marketId);
+              if (m?.race) r.add(raceId(m.race));
+            }
+            return r;
+          },
+          (id, c) => this.portfolio?.holdings(id)[c] ?? 0,
+          () => this.live?.stats.accountValue ?? this.portfolio?.cash ?? 0,
+        );
+      }
       if (!this.live) {
         // The simulator keeps our consumed liquidity until a newer book shows that level changed,
         // so a stale book can never make the engine re-buy depth we already took for real.
