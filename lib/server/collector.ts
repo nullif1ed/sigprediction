@@ -208,14 +208,29 @@ export class Collector {
   async tick() {
     const now = this.now();
     const ts = now.toISOString();
-    if (!this.tournamentId) this.tournamentId = (await this.client.tournament()).id;
+    // SIG is slow and flaky: cache the tournament and market list so a restart can trade at once.
+    if (!this.tournamentId) {
+      const cached = kvGet<string | null>("tournament_id", null);
+      if (cached) this.tournamentId = cached;
+      else {
+        this.tournamentId = (await this.client.tournament()).id;
+        kvSet("tournament_id", this.tournamentId);
+      }
+    }
 
     if (!this.markets.length || now.getTime() - this.lastMarketsAt > config.marketsRefreshSec * 1000) {
-      const raw = await this.client.listMarkets(this.tournamentId).catch((e) => {
-        if (!this.markets.length) throw e;
-        log("WARNING", "collector", "markets_refresh_failed", { error: String(e) });
-        return null;
-      });
+      const raw = await this.client
+        .listMarkets(this.tournamentId)
+        .then((r) => {
+          kvSet("markets_cache", r);
+          return r;
+        })
+        .catch((e) => {
+          const cached = this.markets.length ? null : kvGet<Awaited<ReturnType<SigClient["listMarkets"]>> | null>("markets_cache", null);
+          if (!this.markets.length && !cached?.length) throw e;
+          log("WARNING", "collector", "markets_refresh_failed", { error: String(e), usingCache: !!cached });
+          return cached;
+        });
       if (raw) {
       this.markets = raw.filter((m) => !m.isComposite && m.exchanges.length === 1).map(toSigMarket);
       upsertMarkets(this.markets, ts);
