@@ -316,7 +316,8 @@ export class SigClient {
     for (let i = 0; i < exchangeIds.length; i += 100) {
       const q = new URLSearchParams({ ids: exchangeIds.slice(i, i + 100).join(",") });
       if (tournamentId) q.set("tournamentId", tournamentId);
-      const r = await this.api<{ data: PriceSnapshot[] }>(`/exchanges/prices?${q}`, { timeoutMs: this.timeoutMs, maxRetries: 1 });
+      // Fail fast: the collector continues on cached books, and the next tick retries.
+      const r = await this.api<{ data: PriceSnapshot[] }>(`/exchanges/prices?${q}`, { timeoutMs: Math.min(this.timeoutMs, 20_000), maxRetries: 0 });
       out.push(...r.data);
     }
     return out;

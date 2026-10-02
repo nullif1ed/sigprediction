@@ -211,7 +211,12 @@ export class Collector {
     if (!this.tournamentId) this.tournamentId = (await this.client.tournament()).id;
 
     if (!this.markets.length || now.getTime() - this.lastMarketsAt > config.marketsRefreshSec * 1000) {
-      const raw = await this.client.listMarkets(this.tournamentId);
+      const raw = await this.client.listMarkets(this.tournamentId).catch((e) => {
+        if (!this.markets.length) throw e;
+        log("WARNING", "collector", "markets_refresh_failed", { error: String(e) });
+        return null;
+      });
+      if (raw) {
       this.markets = raw.filter((m) => !m.isComposite && m.exchanges.length === 1).map(toSigMarket);
       upsertMarkets(this.markets, ts);
       this.lastMarketsAt = now.getTime();
@@ -228,6 +233,7 @@ export class Collector {
         this.rtStartedAt = Date.now();
         await this.rt.start(this.tournamentId, this.markets).catch((e) => log("ERROR", "realtime", "start_failed", { error: String(e) }));
       }
+      } else this.lastMarketsAt = now.getTime(); // keep the current list, retry at the next refresh
     }
     // Realtime watchdog: reconnect (new token = 1 write) when the feed went silent, with backoff.
     if (this.rt && !this.rt.healthy(90_000)) {
@@ -252,7 +258,12 @@ export class Collector {
     const pollIds = universeDue ? this.markets : rtOk ? [] : this.markets.filter((m) => hot.has(m.id)).slice(0, 100);
     const dirty: string[] = [];
     if (pollIds.length) {
-      const prices = await this.client.prices(pollIds.map((m) => m.exchangeId), this.tournamentId);
+      // SIG often answers 500/503 or times out: a failed price read must not abort the tick, or
+      // the strategy never runs. Continue on the books we already have (depth workers keep them fresh).
+      const prices = await this.client.prices(pollIds.map((m) => m.exchangeId), this.tournamentId).catch((e) => {
+        log("WARNING", "collector", "prices_failed", { error: String(e), markets: pollIds.length });
+        return [] as Awaited<ReturnType<SigClient["prices"]>>;
+      });
       for (const p of prices) {
         this.tops.set(p.marketId, { bid: p.bestBid, ask: p.bestAsk });
         const prev = this.books.get(p.marketId);
