@@ -344,6 +344,8 @@ export function runPortfolioTick(args: {
     }
     for (const [race, legs] of byRace) {
       if (mixedRace(race)) continue;
+      // Only buy-all-NO sets are riskless; never "complete" a YES position into a set.
+      if (legs.some((l) => l.contract !== "NO") && !cfg.risk.allowBuyAllYes) continue;
       const setIds = portfolio.arbSets.get(race) ?? legs.map((l) => l.marketId);
       const contract = legs[0].contract;
       if (legs.some((l) => l.contract !== contract)) continue;
