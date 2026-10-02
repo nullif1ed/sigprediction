@@ -53,8 +53,9 @@ export const config = {
   liveReconcileSec: num("LIVE_RECONCILE_SEC", 30),
   /** One-time: sell every position at market when live trading starts (runs once per id; "" = off). */
   liquidateRunId: process.env.LIQUIDATE_RUN_ID ?? "liq-final-shutdown",
-  /** Market-making experiment (live only). Runs once per MM_RUN_ID; set MM_ENABLED=0 to skip. */
-  mmEnabled: process.env.MM_ENABLED !== "0",
+  /** Market-making experiment (live only, directional risk, not guaranteed like arbitrage). Off
+   * by default: set MM_ENABLED=1 to opt in. Runs once per MM_RUN_ID. */
+  mmEnabled: process.env.MM_ENABLED === "1",
   mmRunId: process.env.MM_RUN_ID ?? "mm-exp-2",
   mmMarkets: num("MM_MARKETS", 3),
   mmSize: num("MM_SIZE", 500),
@@ -65,7 +66,11 @@ export const config = {
   mmRefreshSec: num("MM_REFRESH_SEC", 10),
   mmWritesReserve: num("MM_WRITES_RESERVE", 8),
   /** Swing catcher: deep resting orders on liquid markets (live, YOLO). SWING_ENABLED=0 disables. */
-  swingEnabled: process.env.SWING_ENABLED !== "0",
+  // Of everything tried, arbitrage is the only strategy with a guaranteed edge (the profit is
+  // locked in by the price gap at entry, not a bet on what price does next). The swing catcher
+  // and market maker are both directional bets with real downside (backtest/live loss cases seen),
+  // so they default OFF; opt in with SWING_ENABLED=1 / MM_ENABLED=1 if you want them running too.
+  swingEnabled: process.env.SWING_ENABLED === "1",
   swingMarkets: num("SWING_MARKETS", 10),
   swingDist: num("SWING_DIST", 0.05),
   swingNotional: num("SWING_NOTIONAL", 4000),
