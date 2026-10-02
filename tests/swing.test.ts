@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb, setDb } from "@/lib/server/db";
+import { config } from "@/lib/server/config";
 import { SwingCatcher } from "@/lib/server/swingCatcher";
 import type { SigClient } from "@/lib/server/sigClient";
 import type { Contract, SigMarket, YesBook } from "@/lib/core/types";
@@ -24,7 +25,7 @@ function fake() {
         return { orderId: id, open: false, quantityTraded: o.quantity, fillPrice: o.price, remainingQuantity: 0 };
       }
       orders.set(id, { ...o, open: true });
-      return { orderId: id, open: true, quantityTraded: 0, fillPrice: null, remainingQuantity: o.quantity };
+      return { orderId: id, open: true, quantityTraded: 0, fillPrice: null, remainingQuantity: o.side === "no" ? -o.quantity : o.quantity }; // SIG signs NO remainders
     },
     async cancelOrder(i: number) {
       const o = orders.get(i);
@@ -63,6 +64,9 @@ describe("swing catcher (deep resting orders)", () => {
     const rest = [...f.orders.values()].filter((o) => o.exchangeId === "e293");
     // mid 0.605: YES bid at 0.555, NO bid at 1 - 0.605 - 0.05 = 0.345 (a YES ask at 0.655)
     expect(rest.map((o) => [o.side, o.price]).sort()).toEqual([["no", 0.345], ["yes", 0.555]]);
+    // A second cycle keeps both quotes (no duplicates, even for the NO order's signed remainder).
+    await sw.cycle();
+    expect([...f.orders.values()].filter((o) => o.exchangeId === "e293" && o.open)).toHaveLength(2);
     // Only one market per race is quoted.
     expect([...f.orders.values()].some((o) => o.exchangeId === "e294")).toBe(false);
 
@@ -79,7 +83,7 @@ describe("swing catcher (deep resting orders)", () => {
     await sw.cycle();
     expect(sw.owned().has("293")).toBe(false);
     expect(sw.stats.exits).toBe(1);
-    expect(sw.stats.realized).toBeCloseTo(Math.floor(1000 / 0.555) * (0.6 - 0.555), 1);
+    expect(sw.stats.realized).toBeCloseTo(Math.floor(config.swingNotional / 0.555) * (0.6 - 0.555), 1);
   });
 
   it("never quotes a race the arbitrage engine holds", async () => {
