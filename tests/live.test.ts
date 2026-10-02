@@ -72,8 +72,8 @@ describe("live execution", () => {
     expect(legs).toHaveLength(2);
     expect(legs.every((l) => l.side === "no" && l.action === "buy" && l.quantity === 500)).toBe(true);
     // Second leg limit: payout 1 - first leg price paid - 0.1pp, on the 0.005 tick.
-    const first = legs[0].exchangeId === "1070" ? 0.4 : 0.55;
-    expect(legs[1].price).toBeCloseTo(Math.floor((1 - first - 0.001) / 0.005) * 0.005, 6);
+    // The fake fills at the limit: the second leg's cap is 1 - (first price paid) - 0.1pp, on tick.
+    expect(legs[1].price).toBeCloseTo(Math.floor((1 - legs[0].price - 0.001) / 0.005) * 0.005, 6);
     expect(t.pf.holdings("381").NO).toBe(500);
     expect(t.pf.arbQty("382", "NO")).toBe(500);
   });
@@ -295,5 +295,20 @@ describe("incomplete and mixed races (NE Senate, 2 Oct)", () => {
     await live.reconcile(true);
     expect(pf.arbSets.has("2026:SENATE:NE")).toBe(false);
     expect(pf.arbQty("281", "NO")).toBe(0);
+  });
+});
+
+describe("first leg limit", () => {
+  it("lets the bottleneck leg pay up to half the planned profit more, never past break-even", async () => {
+    const t = setup((l) => l.quantity);
+    await t.live.reconcile(true);
+    // Planned 0.40 + 0.55 = 0.95: 5pp profit. First leg may pay up to +2.4pp (on tick: +2.0pp).
+    t.tick(arbBooks());
+    await t.live.flush();
+    const legs = t.calls.filter((c) => c.path === "/orders").map((c) => c.body as { exchangeId: string; price: number });
+    const planned = legs[0].exchangeId === "1070" ? 0.4 : 0.55;
+    expect(legs[0].price).toBeGreaterThan(planned);
+    expect(legs[0].price).toBeLessThanOrEqual(planned + 0.024 + 1e-9);
+    expect(legs[0].price + legs[1].price).toBeLessThan(1);
   });
 });
