@@ -1,10 +1,12 @@
-import { fail, ok } from "@/lib/server/http";
+import { fail, ok, statefulGuard } from "@/lib/server/http";
 import { marketDetail } from "@/lib/server/live";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
+export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const g = await statefulGuard(req);
+  if (g) return g;
   const { id } = await ctx.params;
   try {
     const d = await marketDetail(id);

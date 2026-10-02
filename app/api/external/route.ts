@@ -1,4 +1,4 @@
-import { fail, ok } from "@/lib/server/http";
+import { fail, ok, statefulGuard } from "@/lib/server/http";
 import { marketsTable } from "@/lib/server/live";
 import { discrepancy } from "@/lib/server/external";
 import { statefulMode } from "@/lib/server/config";
@@ -6,7 +6,10 @@ import { statefulMode } from "@/lib/server/config";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-export async function GET() {
+export async function GET(req: Request) {
+  // The SIG read budget is per account: only the bot host reads SIG (Vercel proxies or declines).
+  const g = await statefulGuard(req);
+  if (g) return g;
   try {
     const t = await marketsTable();
     let history: ((m: string, v: string) => number[]) | null = null;
