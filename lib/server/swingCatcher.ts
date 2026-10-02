@@ -110,7 +110,10 @@ export class SwingCatcher {
       this.stats.status = "running";
       await this.syncFills();
       await this.manageExits();
-      if (Date.now() - this.lastSelect > 10 * 60_000) this.select();
+      // Full rescan every 10 min; every minute while short of markets (books still loading after a
+      // restart, or quoted races taken by arbitrage).
+      const short = [...this.s.keys()].filter((id) => !this.pos.has(id)).length < config.swingMarkets;
+      if (Date.now() - this.lastSelect > (short ? 60_000 : 10 * 60_000)) this.select();
       await this.quoteAll();
     } catch (e) {
       this.stats.lastError = String(e).slice(0, 200);
