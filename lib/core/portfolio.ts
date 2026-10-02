@@ -38,6 +38,8 @@ export class Portfolio {
   arb = new Map<string, { quantity: number; cost: number }>();
   /** raceId -> marketIds of every leg of the arbitrage set held in that race */
   arbSets = new Map<string, string[]>();
+  /** cash committed elsewhere (resting swing bids): not available to arbitrage entries */
+  reservedCash = 0;
   /** marketId -> epoch ms until which new regular entries are blocked (after a stop loss) */
   cooldownUntil = new Map<string, number>();
 

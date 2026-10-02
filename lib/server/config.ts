@@ -64,6 +64,16 @@ export const config = {
   mmMinutes: num("MM_MINUTES", 60),
   mmRefreshSec: num("MM_REFRESH_SEC", 10),
   mmWritesReserve: num("MM_WRITES_RESERVE", 8),
+  /** Swing catcher: deep resting orders on liquid markets (live, YOLO). SWING_ENABLED=0 disables. */
+  swingEnabled: process.env.SWING_ENABLED !== "0",
+  swingMarkets: num("SWING_MARKETS", 6),
+  swingDist: num("SWING_DIST", 0.05),
+  swingNotional: num("SWING_NOTIONAL", 1000),
+  swingCapitalPct: num("SWING_CAPITAL_PCT", 0.1),
+  swingHoldMin: num("SWING_HOLD_MIN", 60),
+  swingMaxSpread: num("SWING_MAX_SPREAD", 0.03),
+  swingRefreshSec: num("SWING_REFRESH_SEC", 30),
+  swingWritesReserve: num("SWING_WRITES_RESERVE", 8),
   /** Read-only token for GET /api/export/db (database download for offline backtests). Empty disables it. */
   get exportToken() {
     return process.env.BOT_EXPORT_TOKEN ?? "";

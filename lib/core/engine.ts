@@ -384,7 +384,7 @@ export function runPortfolioTick(args: {
         return Math.max(...qs) - Math.min(...qs) < 1;
       })
       .sort((x, y) => y.totalProfit - x.totalProfit);
-    let budget = Math.max(0, portfolio.cash * 0.995);
+    let budget = Math.max(0, portfolio.cash * 0.995 - portfolio.reservedCash);
 
     // 3. Rotation: the best candidate cannot be funded; free capital from the held set whose full
     //    exit gives up the least, if the new set's profit beats what is given up by the margin.

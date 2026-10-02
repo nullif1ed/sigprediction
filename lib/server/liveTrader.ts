@@ -318,14 +318,9 @@ export class LiveTrader {
             log("WARNING", "live", "entry_dropped", { group: g[0].o.group, legs: g.length, reason: this.stats.halted ? "halted" : stale ? "stale" : "write_budget", ageSec: Math.round((Date.now() - g[0].queuedAt) / 1000) });
             continue;
           }
-          // A resting remainder could fill later and unbalance a set: cancel it before the next group.
-          if (await this.send(g.map((x) => x.o))) {
-            try {
-              await this.client.cancelAll(this.tournamentId);
-            } catch (e) {
-              this.fail("cancel_all_failed", e);
-            }
-          }
+          // A resting remainder could fill later and unbalance a set: send() cancels its own
+          // remainders by id (cancel-all would also pull the swing catcher's resting orders).
+          await this.send(g.map((x) => x.o));
         }
       }
       const due = pending.length || Date.now() - this.lastReconcile > config.liveReconcileSec * 1000;
@@ -390,7 +385,9 @@ export class LiveTrader {
       return false;
     }
     let open = false;
+    const openIds: number[] = [];
     results.forEach((r, i) => {
+      if (r.open && r.orderId) openIds.push(r.orderId);
       const l = legs[i];
       const filled = Number(r.quantityTraded ?? 0);
       if (filled > 0) {
@@ -414,6 +411,7 @@ export class LiveTrader {
         orderId: r.orderId,
       });
     });
+    for (const id of openIds) await this.client.cancelOrder(id).catch((e) => this.fail("cancel_failed", e, { orderId: id }));
     return open;
   }
 
