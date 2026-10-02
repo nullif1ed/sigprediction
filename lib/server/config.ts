@@ -23,11 +23,18 @@ export const config = {
   /** top of book for the whole universe (ceil(N/100) reads) */
   universeIntervalSec: num("UNIVERSE_POLL_SEC", 12),
   /** refetch depth of a hot market at least this often */
-  hotDepthMaxAgeSec: num("HOT_DEPTH_MAX_AGE_SEC", 10),
+  hotDepthMaxAgeSec: num("HOT_DEPTH_MAX_AGE_SEC", 20),
+  /** refetch depth of a market nothing is watching at most this often */
+  coldDepthMaxAgeSec: num("COLD_DEPTH_MAX_AGE_SEC", 120),
+  /** depth workers may use at most this share of the read budget; the rest stays free for price
+   * polls and the dashboard, so the key is never run at its limit (which causes 429s/timeouts) */
+  depthBudgetPct: Math.min(1, Math.max(0.1, num("DEPTH_BUDGET_PCT", 60) / 100)),
   /** parallel depth requests per tick */
-  depthConcurrency: num("DEPTH_CONCURRENCY", 4),
+  depthConcurrency: num("DEPTH_CONCURRENCY", 2),
   externalIntervalSec: num("EXTERNAL_POLL_SEC", 90),
-  newsMarketsPerMinute: num("NEWS_MARKETS_PER_MIN", 12),
+  /** SIG website headline feed. Off by default: each call blocks the tick and the site often
+   * times out or 403s. Set NEWS_MARKETS_PER_MIN=12 to turn it back on. */
+  newsMarketsPerMinute: num("NEWS_MARKETS_PER_MIN", 0),
   marketsRefreshSec: num("MARKETS_REFRESH_SEC", 600),
   /** Trade only a sampled fraction of races (1 = all, 0.5 = half) to cut read/write load when
    * hitting SIG's rate limit. Sampling is by race, deterministic (hash of the race id), so a

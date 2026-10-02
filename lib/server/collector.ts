@@ -324,6 +324,7 @@ export class Collector {
     }
 
     // 4. News rotation through the market list.
+    // Off by default (NEWS_MARKETS_PER_MIN=0): no calls to the SIG website headline feed.
     this.newsCredit += (config.newsMarketsPerMinute * config.priceIntervalSec) / 60;
     // YOLO trades arbitrage only: headlines are unused, and each slow news read delays the tick.
     if (this.paperTrading && this.strategy.yolo) this.newsCredit = 0;
@@ -376,17 +377,18 @@ export class Collector {
     let stalestHot: string | null = null;
     for (const id of hot) if (ok(id) && age(id) > config.hotDepthMaxAgeSec * 1000 && (!stalestHot || age(id) > age(stalestHot))) stalestHot = id;
     if (stalestHot) return stalestHot;
-    for (const id of this.lastDirty) if (ok(id) && age(id) > 3000) return id;
+    for (const id of this.lastDirty) if (ok(id) && age(id) > 15_000) return id;
     let stalest: string | null = null;
     for (const m of this.markets) if (ok(m.id) && (!stalest || age(m.id) > age(stalest))) stalest = m.id;
-    return stalest && age(stalest) > 5000 ? stalest : null;
+    return stalest && age(stalest) > config.coldDepthMaxAgeSec * 1000 ? stalest : null;
   }
 
   /** One of DEPTH_CONCURRENCY workers: spends the read budget left after price polling on depth. */
   private async depthWorker() {
     const reserve = () => Math.ceil(Math.max(1, this.markets.length) / 100) + 2;
     while (this.running) {
-      const id = this.tournamentId && this.markets.length && this.client.reads.available() > reserve() ? this.nextDepthTarget(this.now().getTime()) : null;
+      const underCap = this.client.reads.usedLastMinute() < this.client.reads.limit * config.depthBudgetPct;
+      const id = this.tournamentId && this.markets.length && underCap && this.client.reads.available() > reserve() ? this.nextDepthTarget(this.now().getTime()) : null;
       if (!id) {
         await sleep(200);
         continue;
