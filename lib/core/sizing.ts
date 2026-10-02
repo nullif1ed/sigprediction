@@ -19,6 +19,8 @@ export interface RiskConfig {
   /** extra required return per unit of equity already locked in arbitrage (keeps capital for better sets) */
   minArbReturnPerUtil: number;
   allowConditionalArb: boolean; // buy-all-YES sets that fail if an unlisted party wins
+  /** buy-all-YES sets at all: only riskless if SIG's listed outcomes are exhaustive (unknown) */
+  allowBuyAllYes: boolean;
   minConvergence: number; // min P(listed party wins) for a conditional set
   /**
    * Exit-liquidity cap: sets held in a race may not exceed this multiple of the sets that could be
@@ -50,6 +52,7 @@ export const DEFAULT_RISK: RiskConfig = {
   minArbReturn: 0.003,
   minArbReturnPerUtil: 0.01,
   allowConditionalArb: false,
+  allowBuyAllYes: false,
   minConvergence: 0.97,
   arbExitDepthMultiple: 0,
   arbExitBandPp: 0.02,

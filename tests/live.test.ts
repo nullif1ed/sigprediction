@@ -269,3 +269,30 @@ describe("repair orders never overshoot", () => {
     expect(Math.abs(t.held.get("1071")!)).toBe(1000);
   });
 });
+
+describe("incomplete and mixed races (NE Senate, 2 Oct)", () => {
+  const NE = [mk("279", "2001", "Will the Democratic Party win the Nebraska Senate?"), mk("280", "2002", "Will the Republican Party win the Nebraska Senate?"), mk("281", "2003", "Will the Independent Party win the Nebraska Senate?")];
+  it("never arbitrages a race with a missing book", () => {
+    // YES asks 0.08 + 0.30 = 0.38 on two of three outcomes looks like 'buy all YES' if 281 is missing.
+    const books = new Map([["279", book("279", [[0.07, 5000]], [[0.08, 5000]])], ["280", book("280", [[0.29, 5000]], [[0.3, 5000]])]]);
+    const st: MarketState = { now: new Date("2026-10-02T16:00:00Z"), markets: NE, books, external: new Map(), headlines: new Map() };
+    const cfg = mergeStrategy({ name: "t" });
+    expect(computeSignals(st, cfg).arbitrage).toHaveLength(0);
+    const pf = new Portfolio(100_000);
+    const r = runPortfolioTick({ state: st, signals: computeSignals(st, cfg), cfg, portfolio: pf, exec: new PaperExecutionClient(pf), sizingMode: "fixed_fractional", rules: null, tradedHeadlines: new Set() });
+    expect(r.decisions).toHaveLength(0);
+  });
+
+  it("does not buy a leg's contract against locked opposite holdings, nor adopt a mixed race", async () => {
+    const sig = fakeSig((l) => l.quantity);
+    const pf = new Portfolio(100_000);
+    const ms = [...markets, ...NE];
+    const live = new LiveTrader(sig.client, "t1", () => ms, () => pf, undefined, () => true);
+    sig.held.set("2001", 9389); // YES
+    sig.held.set("2002", 9389); // YES
+    sig.held.set("2003", -4878); // NO
+    await live.reconcile(true);
+    expect(pf.arbSets.has("2026:SENATE:NE")).toBe(false);
+    expect(pf.arbQty("281", "NO")).toBe(0);
+  });
+});
