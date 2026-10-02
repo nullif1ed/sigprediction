@@ -20,16 +20,15 @@ import { computeSignals, mergeStrategy, runPortfolioTick, type StrategyConfig } 
 import { Portfolio } from "../core/portfolio";
 import { PaperExecutionClient } from "../core/execution";
 import { RealtimeBooks, type RealtimeStats } from "./realtime";
-import { LiveTrader, type LiveStats } from "./liveTrader";
-import { SwingCatcher, type SwingStats } from "./swingCatcher";
-import { MarketMaker, type MMStats } from "./marketMaker";
-import { PassiveUnwinder, type PassiveStats } from "./passiveUnwind";
-import { raceId } from "../core/races";
+import { raceId, raceSampleScore } from "../core/races";
 import type { ScenarioRules } from "../core/sizing";
 
 // Data collector: polls SIG inside the published rate limit, stores order books, external
-// reference quotes and news headlines, and optionally runs the paper-trading strategy live.
-// Runs inside the Node server process (local laptop on Day 1, a VPS/container on Day 2).
+// reference quotes and news headlines, and runs the paper-trading strategy against them.
+//
+// Paper trading only. This process never places a real order on SIG: the SIG API key it holds
+// only needs READ access (markets, order books, prices, news). There is no code path here that
+// calls a write/order-placement endpoint.
 
 export interface CollectorStatus {
   running: boolean;
@@ -47,12 +46,8 @@ export interface CollectorStatus {
   rateLimited: number;
   priceIntervalSec: number;
   headlinesSeen: number;
-  executionMode: "paper" | "live";
+  executionMode: "paper";
   realtime: RealtimeStats | null;
-  live: LiveStats | null;
-  mm: MMStats | null;
-  passive: PassiveStats | null;
-  swing: SwingStats | null;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -88,18 +83,7 @@ export class Collector {
   rt: RealtimeBooks | null = null;
   /** markets whose realtime stream may have missed an update (refetch over REST) */
   resyncNeeded = new Set<string>();
-  liveMode = false;
-  live: LiveTrader | null = null;
-  private liveReady = false;
-  private liveFlush: Promise<void> | null = null;
   private rtStartedAt = 0;
-  mm: MarketMaker | null = null;
-  passive: PassiveUnwinder | null = null;
-  private passiveLast = 0;
-  private mmBusy: Promise<void> | null = null;
-  swing: SwingCatcher | null = null;
-  private swingLast = 0;
-  private mmLast = 0;
   private lastFair = new Map<string, { p: number; confidence: number }>();
   private rtRestarts = 0;
   private lastExternalAt = 0;
@@ -134,20 +118,14 @@ export class Collector {
       rateLimited: this.client.rateLimited,
       priceIntervalSec: config.priceIntervalSec,
       headlinesSeen: [...this.headlines.values()].reduce((s, h) => s + h.length, 0),
-      executionMode: this.liveMode ? "live" : "paper",
+      executionMode: "paper",
       realtime: this.rt?.stats ?? null,
-      live: this.live?.stats ?? null,
-      mm: this.mm?.stats ?? kvGet<MMStats | null>("mm_experiment", null),
-      passive: this.passive?.stats ?? null,
-      swing: this.swing?.stats ?? kvGet<SwingStats | null>("swing_stats", null),
     };
   }
 
   async start(opts: { paperTrading?: boolean; strategy?: Partial<StrategyConfig> } = {}) {
     if (this.running) return this.status();
     this.paperTrading = Boolean(opts.paperTrading);
-    this.liveMode = this.paperTrading && config.liveTrading && this.client.hasKey;
-    this.liveReady = false;
     if (opts.strategy) this.strategy = mergeStrategy({ ...opts.strategy, name: opts.strategy.name ?? "live-paper" });
     this.running = true;
     this.startedAt = this.now().toISOString();
@@ -165,7 +143,7 @@ export class Collector {
       }
     });
     if (this.paperTrading) this.initPaper();
-    log("INFO", "collector", "started", { runId: this.runId, paperTrading: this.paperTrading, live: this.liveMode, readBudget: this.client.reads.capacity });
+    log("INFO", "collector", "started", { runId: this.runId, paperTrading: this.paperTrading, readBudget: this.client.reads.capacity });
     this.loop = this.run();
     this.workers = Array.from({ length: Math.max(1, config.depthConcurrency) }, () => this.depthWorker());
     return this.status();
@@ -178,11 +156,6 @@ export class Collector {
     await this.loop?.catch(() => undefined);
     await Promise.all(this.workers.map((w) => w.catch(() => undefined)));
     this.workers = [];
-    await this.liveFlush?.catch(() => undefined);
-    await this.mmBusy?.catch(() => undefined);
-    if (this.mm && !this.mm.finished) await this.mm.finish("collector_stopped").catch(() => undefined);
-    await this.passive?.stop().catch(() => undefined);
-    if (this.mm) kvSet("mm_experiment", this.mm.stats);
     await this.rt?.stop().catch(() => undefined);
     this.rt = null;
     db().prepare("UPDATE collector_runs SET stopped_at = ?, status = 'stopped', ticks = ?, reads = ?, errors = ?, note = ? WHERE id = ?")
@@ -237,22 +210,37 @@ export class Collector {
           return cached;
         });
       if (raw) {
-      this.markets = raw.filter((m) => !m.isComposite && m.exchanges.length === 1).map(toSigMarket);
-      upsertMarkets(this.markets, ts);
-      this.lastMarketsAt = now.getTime();
-      this.raceMembers.clear();
-      for (const m of this.markets) if (m.race) this.raceMembers.set(raceId(m.race), [...(this.raceMembers.get(raceId(m.race)) ?? []), m.id]);
-      log("INFO", "collector", "markets_refreshed", { count: this.markets.length });
-      if (config.realtime && this.workers.length && this.client.hasKey) {
-        if (!this.rt)
-          this.rt = new RealtimeBooks(
-            this.client,
-            (b) => this.onRealtimeBook(b),
-            (id) => this.resyncNeeded.add(id),
-          );
-        this.rtStartedAt = Date.now();
-        await this.rt.start(this.tournamentId, this.markets).catch((e) => log("ERROR", "realtime", "start_failed", { error: String(e) }));
-      }
+        let all = raw.filter((m) => !m.isComposite && m.exchanges.length === 1).map(toSigMarket);
+        if (config.marketSamplePct < 1) {
+          // Keep or drop a race's legs together (never split one leg in, the other out): sample by
+          // race id, not by market id.
+          const kept = new Set<string>();
+          const dropped = new Set<string>();
+          all = all.filter((m) => {
+            if (!m.race) return true; // no race grouping possible: always keep
+            const r = raceId(m.race);
+            const keep = kept.has(r) || (!dropped.has(r) && raceSampleScore(r) < config.marketSamplePct);
+            (keep ? kept : dropped).add(r);
+            return keep;
+          });
+          log("WARNING", "collector", "markets_sampled", { pct: config.marketSamplePct, racesKept: kept.size, racesDropped: dropped.size, marketsKept: all.length });
+        }
+        this.markets = all;
+        upsertMarkets(this.markets, ts);
+        this.lastMarketsAt = now.getTime();
+        this.raceMembers.clear();
+        for (const m of this.markets) if (m.race) this.raceMembers.set(raceId(m.race), [...(this.raceMembers.get(raceId(m.race)) ?? []), m.id]);
+        log("INFO", "collector", "markets_refreshed", { count: this.markets.length });
+        if (config.realtime && this.workers.length && this.client.hasKey) {
+          if (!this.rt)
+            this.rt = new RealtimeBooks(
+              this.client,
+              (b) => this.onRealtimeBook(b),
+              (id) => this.resyncNeeded.add(id),
+            );
+          this.rtStartedAt = Date.now();
+          await this.rt.start(this.tournamentId, this.markets).catch((e) => log("ERROR", "realtime", "start_failed", { error: String(e) }));
+        }
       } else this.lastMarketsAt = now.getTime(); // keep the current list, retry at the next refresh
     }
     // Realtime watchdog: reconnect (new token = 1 write) when the feed went silent, with backoff.
@@ -354,22 +342,9 @@ export class Collector {
       }
     }
 
-    // 5. Strategy on the same state the backtester replays; live mode mirrors fills to SIG.
-    if (this.paperTrading) {
-      if (this.liveMode && !this.liveReady) await this.initLive();
-      if (!this.liveMode || this.liveReady) this.paperTick(now);
-      if (this.live && this.liveReady && !this.liveFlush)
-        this.liveFlush = this.live.flush().finally(() => {
-          this.liveFlush = null;
-          this.savePaper();
-        });
-      if (this.liveMode && this.liveReady && !this.mmBusy)
-        this.mmBusy = (async () => {
-          await this.passiveTick();
-          await this.mmTick();
-          await this.swingTick();
-        })().finally(() => (this.mmBusy = null));
-    }
+    // 5. Paper strategy only, on the same state the backtester replays. This process never sends
+    // an order to SIG - the SIG key it holds only needs read access.
+    if (this.paperTrading) this.paperTick(now);
 
     for (const [id, b] of this.books) {
       const mid = bookStats(b).mid;
@@ -431,58 +406,6 @@ export class Collector {
     }
   }
 
-  /** Markets owned by the market maker or a resting passive unwind: the engine leaves them alone. */
-  private ownedMarkets(): Set<string> {
-    return new Set([...(this.mm?.skip() ?? []), ...(this.passive?.owned() ?? []), ...(this.swing?.owned() ?? [])]);
-  }
-
-  /** Passive unwinds of large sets, every 15 s, after the live trader's own batch has settled. */
-  private async passiveTick() {
-    // Runs alongside the live trader's batch: the races it works on are excluded from the engine.
-    if (!this.tournamentId || !this.portfolio || this.strategy.yolo) return;
-    if (!this.passive) this.passive = new PassiveUnwinder(this.client, this.tournamentId, () => this.markets, () => this.portfolio, (id) => this.books.get(id));
-    if (Date.now() - this.passiveLast < 15_000) return;
-    this.passiveLast = Date.now();
-    await this.passive.cycle();
-  }
-
-  /** Market-making experiment: start once per MM_RUN_ID, then refresh quotes every MM_REFRESH_SEC. */
-  /** Deep resting orders (YOLO companion), every SWING_REFRESH_SEC after the live batch. */
-  private async swingTick() {
-    if (!this.swing || !this.tournamentId || !this.portfolio) return;
-    if (Date.now() - this.swingLast < config.swingRefreshSec * 1000) return;
-    this.swingLast = Date.now();
-    await this.swing.cycle();
-    this.portfolio.reservedCash = this.swing.reserved();
-  }
-
-  private async mmTick() {
-    if (!config.mmEnabled || !this.tournamentId || !this.portfolio || this.strategy.yolo) return;
-    if (!this.mm) {
-      const done = kvGet<MMStats | null>("mm_experiment", null);
-      if (done?.runId === config.mmRunId) {
-        // A run interrupted by a restart is over (its quotes were cancelled on start): keep its result.
-        if (done.status === "running" || done.status === "selecting") kvSet("mm_experiment", { ...done, status: "finished", lastError: "interrupted by restart" });
-        return;
-      }
-      if (!(this.rt?.healthy() ?? false) || this.ticks < 5) return; // need fresh full books
-      this.mm = new MarketMaker(this.client, this.tournamentId, (id) => this.books.get(id), (id) => this.lastFair.get(id) ?? null, config.mmRunId);
-      const busy = new Set([...this.portfolio.arbSets.keys()]);
-      const held = new Set(this.portfolio.positions().map((p) => p.marketId));
-      for (const id of held) {
-        const m = this.markets.find((x) => x.id === id);
-        if (m?.race) busy.add(raceId(m.race));
-      }
-      await this.mm.select(this.markets, busy, held);
-      kvSet("mm_experiment", this.mm.stats);
-      return;
-    }
-    if (this.mm.finished || Date.now() - this.mmLast < config.mmRefreshSec * 1000) return;
-    this.mmLast = Date.now();
-    await this.mm.cycle();
-    kvSet("mm_experiment", this.mm.stats);
-  }
-
   private onRealtimeBook(b: YesBook) {
     this.books.set(b.marketId, b);
     this.depthFetchedAt.set(b.marketId, this.now().getTime());
@@ -493,73 +416,6 @@ export class Collector {
     if (this.rt && !this.rt.acceptRest(b.marketId, b.asOf)) return;
     this.books.set(b.marketId, b);
     this.resyncNeeded.delete(b.marketId);
-  }
-
-  /** Live mode: start from SIG's real portfolio before the first decision. */
-  private async initLive() {
-    if (!this.tournamentId || !this.markets.length) return;
-    try {
-      if (!this.swing && config.swingEnabled && this.strategy.yolo) {
-        // Before the first reconcile: markets holding swing fills must not be adopted as arbitrage.
-        this.swing = new SwingCatcher(
-          this.client,
-          this.tournamentId,
-          () => this.markets,
-          (id) => this.books.get(id),
-          () => {
-            const r = new Set(this.portfolio?.arbSets.keys() ?? []);
-            for (const p of this.portfolio?.positions() ?? []) {
-              if (this.swing?.owned().has(p.marketId)) continue;
-              const m = this.markets.find((x) => x.id === p.marketId);
-              if (m?.race) r.add(raceId(m.race));
-            }
-            return r;
-          },
-          (id, c) => this.portfolio?.holdings(id)[c] ?? 0,
-          () => this.live?.stats.accountValue ?? this.portfolio?.cash ?? 0,
-        );
-      }
-      if (!this.live) {
-        // The simulator keeps our consumed liquidity until a newer book shows that level changed,
-        // so a stale book can never make the engine re-buy depth we already took for real.
-        this.live = new LiveTrader(
-          this.client,
-          this.tournamentId,
-          () => this.markets,
-          () => this.portfolio,
-          undefined,
-          () => !this.strategy.regularTrading,
-          (id) => this.exec?.book(id) ?? this.books.get(id),
-          () => this.ownedMarkets(),
-        );
-      }
-      // Resting orders from a previous process (passive unwinds, MM quotes) are untracked now:
-      // cancel them before anything else, so a late fill cannot create an unmanaged position.
-      try {
-        const r = await this.client.cancelAll(this.tournamentId);
-        log("WARNING", "live", "orphan_orders_cancelled", { cancelled: r.cancelled });
-      } catch (e) {
-        log("ERROR", "live", "orphan_cancel_failed", { error: String(e) });
-        return;
-      }
-      await this.live.reconcile(true);
-      this.live.aggressive = this.strategy.yolo;
-      if (config.liquidateRunId && kvGet<string | null>("liquidated", null) !== config.liquidateRunId) {
-        const left = await this.live.liquidateAll();
-        kvSet("liquidated", config.liquidateRunId);
-        if (this.portfolio) {
-          // Start the new strategy from the real post-liquidation state.
-          this.portfolio.peakEquity = this.portfolio.cash;
-          this.portfolio.maxDrawdown = 0;
-        }
-        await this.live.reconcile(true);
-        log("WARNING", "live", "liquidated_for_new_strategy", { runId: config.liquidateRunId, positionsLeft: left });
-      }
-      this.liveReady = true;
-      log("WARNING", "live", "live_trading_started", { accountValue: this.live.stats.accountValue, positions: this.portfolio?.positions().length ?? 0 });
-    } catch (e) {
-      log("ERROR", "live", "initial_reconcile_failed", { error: String(e) });
-    }
   }
 
   /** Markets worth refreshing every fast tick. */
@@ -595,19 +451,12 @@ export class Collector {
     return out;
   }
 
-  private get pfKey() {
-    return this.liveMode ? "live_portfolio" : "paper_portfolio";
-  }
-
   initPaper() {
-    const saved = kvGet<ReturnType<Portfolio["toJSON"]> | null>(this.pfKey, null);
+    const saved = kvGet<ReturnType<Portfolio["toJSON"]> | null>("paper_portfolio", null);
     this.portfolio = saved ? Portfolio.fromJSON(saved) : new Portfolio(config.initialBankroll);
     this.tradedHeadlines = new Set(kvGet<string[]>("paper_traded_headlines", []));
     this.exec = new PaperExecutionClient(this.portfolio, {
-      onOrder: (o) => {
-        upsertOrder(o);
-        this.live?.capture(o);
-      },
+      onOrder: (o) => upsertOrder(o),
       onFill: (f) => {
         insertFill(f);
         log("INFO", "paper", "fill", { ...f });
@@ -617,7 +466,7 @@ export class Collector {
 
   private savePaper() {
     if (!this.portfolio) return;
-    kvSet(this.pfKey, this.portfolio.toJSON());
+    kvSet("paper_portfolio", this.portfolio.toJSON());
     kvSet("paper_traded_headlines", [...this.tradedHeadlines].slice(-5000));
   }
 
@@ -625,9 +474,7 @@ export class Collector {
     if (!this.portfolio || !this.exec) return;
     const races = new Map(this.markets.map((m) => [m.id, m.race ? raceId(m.race) : m.id]));
     this.portfolio.raceOf = (id) => races.get(id) ?? id;
-    // Live: decide only on full-depth books that are not waiting for a resync.
-    const books = this.liveMode ? new Map([...this.books].filter(([id, b]) => !b.topOnly && !this.resyncNeeded.has(id))) : this.books;
-    const state = { now, markets: this.markets, books, external: this.external, headlines: this.headlines, prevMids: this.prevMids };
+    const state = { now, markets: this.markets, books: this.books, external: this.external, headlines: this.headlines, prevMids: this.prevMids };
     const signals = computeSignals(state, this.strategy);
     for (const [id, f] of signals.fair) this.lastFair.set(id, { p: f.fairProbability, confidence: f.confidence });
     // Keep the markets the strategy is looking at in the fast polling set for a minute.
@@ -645,7 +492,6 @@ export class Collector {
       rules,
       tradedHeadlines: this.tradedHeadlines,
       onDecision: (d) => insertDecision(d),
-      skipMarkets: this.ownedMarkets(),
     });
     for (const l of r.logs) log(l.level, "paper", l.message, l.context ?? {});
     const snap = this.portfolio.snapshot(this.books, now.toISOString());

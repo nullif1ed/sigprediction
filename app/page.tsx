@@ -8,10 +8,10 @@ interface Status {
   statefulMode: "local" | "proxy" | "unavailable";
   hasApiKey: boolean;
   tournament: string;
-  rateLimits: { readsPerMinute: number; writesPerMinute: number; safety: number; source: string };
+  rateLimits: { readsPerMinute: number; safety: number; source: string };
   polling: { priceIntervalSec: number; externalIntervalSec: number; newsMarketsPerMinute: number };
   adminTokenRequired: boolean;
-  executionMode?: "paper" | "live";
+  executionMode?: "paper";
 }
 interface CollectorResp {
   status: {
@@ -23,10 +23,7 @@ interface CollectorResp {
     depthBooks: number;
     paperTrading: boolean;
     lastError: string | null;
-    executionMode?: "paper" | "live";
-    live?: { accountValue: number | null; securedValue: number | null; startValue: number | null; cash: number | null; ordersSent: number; ordersFilled: number; errors: number; halted: string | null } | null;
-    mm?: { status: string; endsAt: string | null; fills: number; sharesTraded: number; spreadCaptured: number; markout60: number; pnl: number; markets: { title: string; inv: number; pnl: number }[] } | null;
-    passive?: { resting: { race: string; price: number; remaining: number }[]; pairsSold: number; setsClosed: number; profit: number } | null;
+    executionMode?: "paper";
     readsLastMinute: number;
     readBudgetPerMinute: number;
     rateLimited: number;
@@ -112,7 +109,7 @@ export default function Dashboard() {
               </button>
               <label className="flex items-center gap-1 text-sm">
                 <input type="checkbox" checked={paperOn} disabled={s?.running} onChange={(e) => setPaperOn(e.target.checked)} />
-                {status.data?.executionMode === "live" ? "Trade LIVE on SIG while collecting (real orders)" : "Paper-trade live while collecting"}
+                Paper-trade while collecting (simulated fills only - this app never places a real order)
               </label>
               {status.data?.adminTokenRequired && (
                 <input
@@ -139,20 +136,11 @@ export default function Dashboard() {
               </div>
             )}
             {s?.lastError && <ErrorBox error={`Last tick error: ${s.lastError}`} />}
-            {s?.executionMode === "live" && s.live && (
-              <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
-                <Stat label="Secured value (cash + set payouts)" value={fmt.n(s.live.securedValue, 0)} sub={`vs start ${fmt.n(s.live.startValue, 0)}`} tone={(s.live.securedValue ?? 0) >= (s.live.startValue ?? 0) ? undefined : "neg"} />
-                <Stat label="SIG account value (mid-marked)" value={fmt.n(s.live.accountValue, 0)} sub={`cash ${fmt.n(s.live.cash, 0)}`} />
-                <Stat label="Live orders" value={`${s.live.ordersFilled}/${s.live.ordersSent}`} sub={`${s.live.errors} errors${s.live.halted ? " - HALTED" : ""}`} />
-                <Stat label="Passive unwinds" value={s.passive ? `${s.passive.setsClosed} sets` : "-"} sub={s.passive ? `profit ${fmt.n(s.passive.profit, 2)}, ${s.passive.resting.length} resting` : ""} />
-                <Stat label="MM experiment" value={s.mm ? `${fmt.n(s.mm.pnl, 2)}` : "-"} sub={s.mm ? `${s.mm.status}, ${s.mm.fills} fills, markout ${fmt.n(s.mm.markout60, 2)}` : ""} />
-              </div>
-            )}
           </div>
         )}
         {status.data && (
           <p className="mt-3 text-xs text-slate-500">
-            Rate limit: {status.data.rateLimits.readsPerMinute} reads / {status.data.rateLimits.writesPerMinute} writes per minute per key, used at{" "}
+            Rate limit: {status.data.rateLimits.readsPerMinute} reads per minute per key (read-only, no order writes), used at{" "}
             {Math.round(status.data.rateLimits.safety * 100)}% ({status.data.rateLimits.source}). Bulk prices cost ⌈markets/100⌉ reads per poll; the rest of the budget refreshes depth.
           </p>
         )}
