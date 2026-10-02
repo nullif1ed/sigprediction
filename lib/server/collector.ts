@@ -306,6 +306,8 @@ export class Collector {
 
     // 4. News rotation through the market list.
     this.newsCredit += (config.newsMarketsPerMinute * config.priceIntervalSec) / 60;
+    // YOLO trades arbitrage only: headlines are unused, and each slow news read delays the tick.
+    if (this.paperTrading && this.strategy.yolo) this.newsCredit = 0;
     while (this.newsCredit >= 1 && this.markets.length) {
       this.newsCredit -= 1;
       const m = this.markets[this.newsCursor++ % this.markets.length];

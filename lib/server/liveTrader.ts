@@ -6,6 +6,7 @@ import type { Contract, PaperOrder, SigMarket, YesBook } from "../core/types";
 import type { Portfolio } from "../core/portfolio";
 import { availableQuantity, contractLevels, round } from "../core/orderbook";
 import { raceId } from "../core/races";
+import { sizeSet } from "../core/arbitrage";
 
 // LIVE execution on SIG.
 //
@@ -287,7 +288,7 @@ export class LiveTrader {
       // Entries decided on an older book than the newest batch are superseded: drop them.
       const newest = Math.max(0, ...pending.filter((p) => !isExit(p.o)).map((p) => p.queuedAt));
       for (let i = pending.length - 1; i >= 0; i--)
-        if (!isExit(pending[i].o) && pending[i].queuedAt < newest - 1000) {
+        if (!isExit(pending[i].o) && !/^arbitrage:arbitrage/.test(pending[i].o.tag ?? "") && pending[i].queuedAt < newest - 1000) {
           pending.splice(i, 1);
           this.stats.dropped++;
         }
@@ -308,8 +309,13 @@ export class LiveTrader {
         const ordered = [...groups.values()].sort((a, b) => Number(!a.some((x) => isExit(x.o))) - Number(!b.some((x) => isExit(x.o))));
         for (const g of ordered) {
           const exit = g.some((x) => isExit(x.o));
-          if (!exit && (this.stats.halted || Date.now() - g[0].queuedAt > config.liveMaxOrderAgeSec * 1000 || this.client.writes.available() <= 1)) {
+          // Arbitrage sets are re-checked on fresh books just before sending (sendSequential), so age
+          // alone does not invalidate them; with SIG answering in 30-60 s it dropped every set.
+          const arbSet = g.length > 1 && g.every((x) => /^arbitrage:arbitrage/.test(x.o.tag ?? ""));
+          const stale = !arbSet && Date.now() - g[0].queuedAt > config.liveMaxOrderAgeSec * 1000;
+          if (!exit && (this.stats.halted || stale || this.client.writes.available() <= 1)) {
             this.stats.dropped += g.length;
+            log("WARNING", "live", "entry_dropped", { group: g[0].o.group, legs: g.length, reason: this.stats.halted ? "halted" : stale ? "stale" : "write_budget", ageSec: Math.round((Date.now() - g[0].queuedAt) / 1000) });
             continue;
           }
           // A resting remainder could fill later and unbalance a set: cancel it before the next group.
@@ -422,8 +428,39 @@ export class LiveTrader {
    */
   private async sendSequential(legs: { o: PaperOrder; input: OrderInput }[]): Promise<boolean> {
     const payout = legs[0].input.side === "no" ? legs.length - 1 : 1;
+    // Re-check the set on FRESH books: equal shares on every leg, sized to the depth that is still
+    // profitable together, each leg's limit at the deepest level that size walks to. The engine's
+    // cached books are net of our own simulated fill, so only fresh books for EVERY leg re-size;
+    // otherwise the engine's plan is sent (still capped at break-even below).
+    const fresh = new Map<string, YesBook>();
+    await Promise.all(
+      legs.map(async (l) => {
+        const b = await this.client.orderbook(l.o.marketId, this.tournamentId, 50).catch(() => null);
+        if (b) fresh.set(l.o.marketId, b);
+      }),
+    );
+    const bookOf = (id: string) => fresh.get(id) ?? this.getBook(id);
+    if (fresh.size === legs.length) {
+      const sized = sizeSet(legs.map((l) => ({ marketId: l.o.marketId, action: l.o.action, book: fresh.get(l.o.marketId)! })), payout, Math.min(...legs.map((l) => l.input.quantity)), 0.002);
+      if (!sized || sized.q < 1) {
+        log("WARNING", "live", "entry_skipped", { reason: "gone_on_fresh_book", markets: legs.map((l) => l.o.marketId) });
+        return false;
+      }
+      for (const l of legs) {
+        let left = sized.q;
+        let worst = 0;
+        for (const lv of contractLevels(fresh.get(l.o.marketId)!, l.o.action)) {
+          worst = lv.price;
+          left -= lv.quantity;
+          if (left <= 0) break;
+        }
+        l.input.quantity = Math.floor(sized.q);
+        l.input.price = onTick(worst, "up");
+      }
+      log("INFO", "live", "entry_resized", { markets: legs.map((l) => l.o.marketId), sets: Math.floor(sized.q), costPerSet: round(sized.cost / sized.q, 4), profit: round(sized.q * payout - sized.cost, 2) });
+    } else log("INFO", "live", "entry_planned", { markets: legs.map((l) => l.o.marketId), sets: Math.min(...legs.map((l) => l.input.quantity)), freshBooks: fresh.size });
     const ratio = (l: { o: PaperOrder; input: OrderInput }) => {
-      const b = this.getBook(l.o.marketId);
+      const b = bookOf(l.o.marketId);
       if (!b) return 1;
       return availableQuantity(b, l.o.action, l.input.price) / Math.max(1, l.input.quantity);
     };
