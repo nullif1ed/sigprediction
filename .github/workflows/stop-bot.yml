@@ -1,7 +1,8 @@
 name: Stop bot on droplet
 
 # One-off: calls the collector's stop API (sets collector_desired=false, so instrumentation.ts
-# will not auto-resume it on the next process start), THEN stops the pm2 process entirely.
+# will not auto-resume it next time anything restarts the process), then DELETES the pm2 process
+# (not just "stop") and removes any pm2 startup/resurrect hook, so nothing brings it back up.
 on:
   workflow_dispatch: {}
 
@@ -20,21 +21,26 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
 
-      - name: Stop collector properly, then stop pm2
+      - name: Stop collector properly, then kill pm2 and disable auto-restart
         env:
           HOST: ${{ secrets.DROPLET_HOST }}
         run: |
           ssh -i ~/.ssh/deploy_key root@$HOST "bash -se" <<'INNER'
-          set -euo pipefail
+          set -uo pipefail
           cd ~/sigprediction
           ADMIN=$(grep '^BOT_ADMIN_TOKEN=' .env.local | head -1 | cut -d= -f2- || true)
           echo "Calling stop API (sets collector_desired=false)..."
-          curl -s -X POST localhost:3000/api/collector -H 'content-type: application/json' -H "x-bot-token: $ADMIN" -d '{"action":"stop"}'
+          curl -s -m 20 -X POST localhost:3000/api/collector -H 'content-type: application/json' -H "x-bot-token: $ADMIN" -d '{"action":"stop"}' || echo "(stop API call timed out/failed, continuing to kill the process anyway)"
           echo
-          sleep 3
-          curl -s localhost:3000/api/collector | grep -o '"running":[a-z]*' || true
-          echo "Stopping pm2 process..."
-          pm2 stop sigprediction
-          pm2 save
+          echo "Deleting pm2 process entirely..."
+          pm2 delete sigprediction || true
+          pm2 save --force
+          echo "Removing any pm2 systemd/cron resurrect hook..."
+          pm2 unstartup systemd || true
+          systemctl disable pm2-root 2>/dev/null || true
+          systemctl stop pm2-root 2>/dev/null || true
+          echo "Final check: is anything still listening on :3000?"
+          sleep 2
+          ss -ltnp | grep ':3000' || echo "nothing listening on :3000"
           pm2 list
           INNER
