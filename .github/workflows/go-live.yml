@@ -1,0 +1,69 @@
+name: Configure live trading on droplet
+
+# Sets SIG_API_KEY + LIVE_TRADING on the droplet and (re)starts collection.
+# `payload` is the API key encrypted with AES-256-GCM under sha256(BOT_EXPORT_TOKEN), which only
+# the droplet (and its owner) has, so the plaintext key never appears in this public repository
+# or in workflow logs.
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "base64(iv | tag | ciphertext) of the SIG API key"
+        required: false
+        default: ""
+      live:
+        description: "1 = live trading, 0 = paper"
+        required: true
+        default: "1"
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up SSH key
+        env:
+          KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+
+      - name: Configure and start
+        env:
+          HOST: ${{ secrets.DROPLET_HOST }}
+          PAYLOAD: ${{ inputs.payload }}
+          LIVE: ${{ inputs.live }}
+        run: |
+          case "$PAYLOAD" in *[!A-Za-z0-9+/=]*) echo "bad payload"; exit 1;; esac
+          case "$LIVE" in 0|1) ;; *) echo "live must be 0 or 1"; exit 1;; esac
+          ssh -i ~/.ssh/deploy_key root@$HOST "PAYLOAD='$PAYLOAD' LIVE='$LIVE' bash -se" <<'EOF'
+          set -euo pipefail
+          cd ~/sigprediction
+          if [ -n "$PAYLOAD" ]; then
+            TOKEN=$(grep '^BOT_EXPORT_TOKEN=' .env.local | head -1 | cut -d= -f2-)
+            KEY=$(PAYLOAD="$PAYLOAD" TOKEN="$TOKEN" node -e '
+              const c = require("node:crypto");
+              const b = Buffer.from(process.env.PAYLOAD, "base64");
+              const d = c.createDecipheriv("aes-256-gcm", c.createHash("sha256").update(process.env.TOKEN).digest(), b.subarray(0, 12));
+              d.setAuthTag(b.subarray(12, 28));
+              process.stdout.write(Buffer.concat([d.update(b.subarray(28)), d.final()]).toString());')
+            case "$KEY" in ace_*) ;; *) echo "decrypted key has an unexpected format"; exit 1;; esac
+            sed -i '/^SIG_API_KEY=/d' .env.local
+            printf 'SIG_API_KEY=%s\n' "$KEY" >> .env.local
+            echo "SIG_API_KEY updated"
+          fi
+          sed -i '/^LIVE_TRADING=/d' .env.local
+          printf 'LIVE_TRADING=%s\n' "$LIVE" >> .env.local
+          pm2 restart sigprediction > /dev/null
+          for i in $(seq 1 30); do curl -sf localhost:3000/api/status > /dev/null && break; sleep 2; done
+          ADMIN=$(grep '^BOT_ADMIN_TOKEN=' .env.local | head -1 | cut -d= -f2- || true)
+          api() { curl -s -X POST localhost:3000/api/collector -H 'content-type: application/json' -H "x-bot-token: $ADMIN" -d "$1"; echo; }
+          api '{"action":"stop"}' > /dev/null
+          api '{"action":"start","paperTrading":true}' | head -c 300
+          sleep 20
+          curl -s localhost:3000/api/status | grep -o '"executionMode":"[a-z]*"'
+          curl -s localhost:3000/api/collector | grep -o '"running":[a-z]*\|"ticks":[0-9]*\|"executionMode":"[a-z]*"' | head -3
+          EOF
