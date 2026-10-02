@@ -11,6 +11,7 @@ interface Status {
   rateLimits: { readsPerMinute: number; writesPerMinute: number; safety: number; source: string };
   polling: { priceIntervalSec: number; externalIntervalSec: number; newsMarketsPerMinute: number };
   adminTokenRequired: boolean;
+  executionMode?: "paper" | "live";
 }
 interface CollectorResp {
   status: {
@@ -107,7 +108,7 @@ export default function Dashboard() {
               </button>
               <label className="flex items-center gap-1 text-sm">
                 <input type="checkbox" checked={paperOn} disabled={s?.running} onChange={(e) => setPaperOn(e.target.checked)} />
-                Paper-trade live while collecting
+                {status.data?.executionMode === "live" ? "Trade LIVE on SIG while collecting (real orders)" : "Paper-trade live while collecting"}
               </label>
               {status.data?.adminTokenRequired && (
                 <input

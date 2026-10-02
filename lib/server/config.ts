@@ -17,7 +17,7 @@ export const config = {
   readsPerMinute: num("SIG_READS_PER_MIN", 100),
   writesPerMinute: num("SIG_WRITES_PER_MIN", 30),
   // The budget is per account and shared with the dashboard / Vercel UI / live trader.
-  rateSafety: num("SIG_RATE_SAFETY", 0.75),
+  rateSafety: num("SIG_RATE_SAFETY", 0.85),
   requestTimeoutMs: num("SIG_TIMEOUT_MS", 12_000),
 
   /** fast loop: top of book for the "hot" markets (positions, arbitrage races, live signals) */
@@ -38,6 +38,19 @@ export const config = {
 
   /** Optional shared secret for mutating endpoints (start/stop/reset). */
   adminToken: process.env.BOT_ADMIN_TOKEN ?? "",
+  /** Order books from SIG Realtime (no REST reads); REST is only used to resync. */
+  realtime: process.env.REALTIME !== "0",
+  /** REAL orders on SIG. Off unless LIVE_TRADING=1. */
+  get liveTrading() {
+    return process.env.LIVE_TRADING === "1";
+  },
+  /** max notional (SUSQies) of one live order leg */
+  liveMaxOrderNotional: num("LIVE_MAX_ORDER_NOTIONAL", 25_000),
+  /** stop opening new live positions when account value falls this far below its start */
+  liveMaxDrawdown: num("LIVE_MAX_DRAWDOWN", 0.05),
+  /** live entries older than this when their turn to be sent comes are dropped (stale) */
+  liveMaxOrderAgeSec: num("LIVE_MAX_ORDER_AGE_SEC", 20),
+  liveReconcileSec: num("LIVE_RECONCILE_SEC", 30),
   /** Read-only token for GET /api/export/db (database download for offline backtests). Empty disables it. */
   get exportToken() {
     return process.env.BOT_EXPORT_TOKEN ?? "";

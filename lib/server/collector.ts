@@ -19,6 +19,8 @@ import { bookStats } from "../core/orderbook";
 import { computeSignals, mergeStrategy, runPortfolioTick, type StrategyConfig } from "../core/engine";
 import { Portfolio } from "../core/portfolio";
 import { PaperExecutionClient } from "../core/execution";
+import { RealtimeBooks, type RealtimeStats } from "./realtime";
+import { LiveTrader, type LiveStats } from "./liveTrader";
 import { raceId } from "../core/races";
 import type { ScenarioRules } from "../core/sizing";
 
@@ -42,6 +44,9 @@ export interface CollectorStatus {
   rateLimited: number;
   priceIntervalSec: number;
   headlinesSeen: number;
+  executionMode: "paper" | "live";
+  realtime: RealtimeStats | null;
+  live: LiveStats | null;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -74,6 +79,13 @@ export class Collector {
   private inFlight = new Set<string>();
   private depthDone = 0;
   private workers: Promise<void>[] = [];
+  rt: RealtimeBooks | null = null;
+  /** markets whose realtime stream may have missed an update (refetch over REST) */
+  resyncNeeded = new Set<string>();
+  liveMode = false;
+  live: LiveTrader | null = null;
+  private liveReady = false;
+  private liveFlush: Promise<void> | null = null;
   private lastExternalAt = 0;
   private newsCursor = 0;
   private newsCredit = 0;
@@ -106,12 +118,17 @@ export class Collector {
       rateLimited: this.client.rateLimited,
       priceIntervalSec: config.priceIntervalSec,
       headlinesSeen: [...this.headlines.values()].reduce((s, h) => s + h.length, 0),
+      executionMode: this.liveMode ? "live" : "paper",
+      realtime: this.rt?.stats ?? null,
+      live: this.live?.stats ?? null,
     };
   }
 
   async start(opts: { paperTrading?: boolean; strategy?: Partial<StrategyConfig> } = {}) {
     if (this.running) return this.status();
     this.paperTrading = Boolean(opts.paperTrading);
+    this.liveMode = this.paperTrading && config.liveTrading && this.client.hasKey;
+    this.liveReady = false;
     if (opts.strategy) this.strategy = mergeStrategy({ ...opts.strategy, name: opts.strategy.name ?? "live-paper" });
     this.running = true;
     this.startedAt = this.now().toISOString();
@@ -129,7 +146,7 @@ export class Collector {
       }
     });
     if (this.paperTrading) this.initPaper();
-    log("INFO", "collector", "started", { runId: this.runId, paperTrading: this.paperTrading, readBudget: this.client.reads.capacity });
+    log("INFO", "collector", "started", { runId: this.runId, paperTrading: this.paperTrading, live: this.liveMode, readBudget: this.client.reads.capacity });
     this.loop = this.run();
     this.workers = Array.from({ length: Math.max(1, config.depthConcurrency) }, () => this.depthWorker());
     return this.status();
@@ -142,6 +159,9 @@ export class Collector {
     await this.loop?.catch(() => undefined);
     await Promise.all(this.workers.map((w) => w.catch(() => undefined)));
     this.workers = [];
+    await this.liveFlush?.catch(() => undefined);
+    await this.rt?.stop().catch(() => undefined);
+    this.rt = null;
     db().prepare("UPDATE collector_runs SET stopped_at = ?, status = 'stopped', ticks = ?, reads = ?, errors = ?, note = ? WHERE id = ?")
       .run(this.now().toISOString(), this.ticks, this.client.reads.used, this.client.errors, reason, this.runId);
     if (this.paperTrading) this.savePaper();
@@ -180,20 +200,38 @@ export class Collector {
       this.raceMembers.clear();
       for (const m of this.markets) if (m.race) this.raceMembers.set(raceId(m.race), [...(this.raceMembers.get(raceId(m.race)) ?? []), m.id]);
       log("INFO", "collector", "markets_refreshed", { count: this.markets.length });
+      if (config.realtime && this.workers.length && this.client.hasKey) {
+        if (!this.rt)
+          this.rt = new RealtimeBooks(
+            this.client,
+            (b) => this.onRealtimeBook(b),
+            (id) => this.resyncNeeded.add(id),
+          );
+        await this.rt.start(this.tournamentId, this.markets).catch((e) => log("ERROR", "realtime", "start_failed", { error: String(e) }));
+      }
     }
 
     // 1. Top of book. The whole universe every UNIVERSE_POLL_SEC (ceil(N / 100) reads); in between,
     // only the hot set (held positions, arbitrage races, live signals) in a single read, so the
     // markets we can act on are refreshed every PRICE_POLL_SEC.
+    // With a healthy Realtime feed every book is pushed to us, so REST prices are only a slow
+    // cross-check (a disagreement marks the market for resync instead of overwriting the book).
+    const rtOk = this.rt?.healthy() ?? false;
     const hot = this.hotMarkets(now.getTime());
-    const universeDue = !this.books.size || now.getTime() - this.lastUniverseAt >= config.universeIntervalSec * 1000;
-    const pollIds = universeDue ? this.markets : this.markets.filter((m) => hot.has(m.id)).slice(0, 100);
+    const universeEvery = (rtOk ? Math.max(30, config.universeIntervalSec) : config.universeIntervalSec) * 1000;
+    const universeDue = !this.books.size || now.getTime() - this.lastUniverseAt >= universeEvery;
+    const pollIds = universeDue ? this.markets : rtOk ? [] : this.markets.filter((m) => hot.has(m.id)).slice(0, 100);
     const dirty: string[] = [];
     if (pollIds.length) {
       const prices = await this.client.prices(pollIds.map((m) => m.exchangeId), this.tournamentId);
       for (const p of prices) {
         this.tops.set(p.marketId, { bid: p.bestBid, ask: p.bestAsk });
         const prev = this.books.get(p.marketId);
+        const rtAt = this.rt?.updatedAt.get(p.marketId) ?? 0;
+        if (rtOk && prev && !prev.topOnly && Date.now() - rtAt < 120_000) {
+          if ((prev.bids[0]?.price ?? null) !== p.bestBid || (prev.asks[0]?.price ?? null) !== p.bestAsk) this.resyncNeeded.add(p.marketId);
+          continue;
+        }
         const next = bookFromPrice(p, prev);
         if (next !== prev) dirty.push(p.marketId);
         this.books.set(p.marketId, next);
@@ -211,7 +249,7 @@ export class Collector {
         if (!id) break;
         try {
           const b = await this.client.orderbook(id, this.tournamentId, 50);
-          if (b) this.books.set(id, b);
+          if (b) this.acceptRestBook(b);
           this.depthDone++;
         } catch (e) {
           log("WARNING", "collector", "depth_failed", { marketId: id, error: String(e) });
@@ -254,8 +292,16 @@ export class Collector {
       }
     }
 
-    // 5. Live paper trading on the same state the backtester replays.
-    if (this.paperTrading) this.paperTick(now);
+    // 5. Strategy on the same state the backtester replays; live mode mirrors fills to SIG.
+    if (this.paperTrading) {
+      if (this.liveMode && !this.liveReady) await this.initLive();
+      if (!this.liveMode || this.liveReady) this.paperTick(now);
+      if (this.live && this.liveReady && !this.liveFlush)
+        this.liveFlush = this.live.flush().finally(() => {
+          this.liveFlush = null;
+          this.savePaper();
+        });
+    }
 
     for (const [id, b] of this.books) {
       const mid = bookStats(b).mid;
@@ -275,6 +321,13 @@ export class Collector {
     const age = (id: string) => nowMs - (this.depthFetchedAt.get(id) ?? 0);
     const ok = (id: string) => !this.inFlight.has(id);
     const hot = this.hotMarkets(nowMs);
+    for (const id of this.resyncNeeded) if (ok(id) && age(id) > 1500) return id;
+    const rtOk = this.rt?.healthy() ?? false;
+    // Realtime keeps fetched books current: only books never fetched in full still need REST.
+    if (rtOk) {
+      for (const m of this.markets) if (ok(m.id) && (this.books.get(m.id)?.topOnly ?? true) && age(m.id) > 30_000) return m.id;
+      return null;
+    }
     for (const id of this.arbHintMarkets()) if (ok(id) && age(id) > 1500) return id;
     for (const id of this.lastDirty) if (ok(id) && hot.has(id) && age(id) > 1500) return id;
     let stalestHot: string | null = null;
@@ -298,7 +351,7 @@ export class Collector {
       this.inFlight.add(id);
       try {
         const b = await this.client.orderbook(id, this.tournamentId!, 50);
-        if (b) this.books.set(id, b);
+        if (b) this.acceptRestBook(b);
         this.depthFetchedAt.set(id, this.now().getTime());
         this.depthDone++;
       } catch (e) {
@@ -307,6 +360,33 @@ export class Collector {
       } finally {
         this.inFlight.delete(id);
       }
+    }
+  }
+
+  private onRealtimeBook(b: YesBook) {
+    this.books.set(b.marketId, b);
+    this.depthFetchedAt.set(b.marketId, this.now().getTime());
+    this.resyncNeeded.delete(b.marketId);
+  }
+
+  private acceptRestBook(b: YesBook) {
+    if (this.rt && !this.rt.acceptRest(b.marketId, b.asOf)) return;
+    this.books.set(b.marketId, b);
+    this.resyncNeeded.delete(b.marketId);
+  }
+
+  /** Live mode: start from SIG's real portfolio before the first decision. */
+  private async initLive() {
+    if (!this.tournamentId || !this.markets.length) return;
+    try {
+      if (!this.live) {
+        this.live = new LiveTrader(this.client, this.tournamentId, () => this.markets, () => this.portfolio, () => this.exec?.resetConsumption());
+      }
+      await this.live.reconcile(true);
+      this.liveReady = true;
+      log("WARNING", "live", "live_trading_started", { accountValue: this.live.stats.accountValue, positions: this.portfolio?.positions().length ?? 0 });
+    } catch (e) {
+      log("ERROR", "live", "initial_reconcile_failed", { error: String(e) });
     }
   }
 
@@ -343,12 +423,19 @@ export class Collector {
     return out;
   }
 
+  private get pfKey() {
+    return this.liveMode ? "live_portfolio" : "paper_portfolio";
+  }
+
   initPaper() {
-    const saved = kvGet<ReturnType<Portfolio["toJSON"]> | null>("paper_portfolio", null);
+    const saved = kvGet<ReturnType<Portfolio["toJSON"]> | null>(this.pfKey, null);
     this.portfolio = saved ? Portfolio.fromJSON(saved) : new Portfolio(config.initialBankroll);
     this.tradedHeadlines = new Set(kvGet<string[]>("paper_traded_headlines", []));
     this.exec = new PaperExecutionClient(this.portfolio, {
-      onOrder: (o) => upsertOrder(o),
+      onOrder: (o) => {
+        upsertOrder(o);
+        this.live?.capture(o);
+      },
       onFill: (f) => {
         insertFill(f);
         log("INFO", "paper", "fill", { ...f });
@@ -358,7 +445,7 @@ export class Collector {
 
   private savePaper() {
     if (!this.portfolio) return;
-    kvSet("paper_portfolio", this.portfolio.toJSON());
+    kvSet(this.pfKey, this.portfolio.toJSON());
     kvSet("paper_traded_headlines", [...this.tradedHeadlines].slice(-5000));
   }
 
@@ -366,7 +453,9 @@ export class Collector {
     if (!this.portfolio || !this.exec) return;
     const races = new Map(this.markets.map((m) => [m.id, m.race ? raceId(m.race) : m.id]));
     this.portfolio.raceOf = (id) => races.get(id) ?? id;
-    const state = { now, markets: this.markets, books: this.books, external: this.external, headlines: this.headlines, prevMids: this.prevMids };
+    // Live: decide only on full-depth books that are not waiting for a resync.
+    const books = this.liveMode ? new Map([...this.books].filter(([id, b]) => !b.topOnly && !this.resyncNeeded.has(id))) : this.books;
+    const state = { now, markets: this.markets, books, external: this.external, headlines: this.headlines, prevMids: this.prevMids };
     const signals = computeSignals(state, this.strategy);
     // Keep the markets the strategy is looking at in the fast polling set for a minute.
     const until = now.getTime() + 60_000;

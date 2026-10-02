@@ -64,6 +64,7 @@ export interface OrderInput {
   /** limit in side-relative terms on the 0.005 tick; omit for a market order */
   price?: number;
   tournamentId?: string;
+  expirationDate?: string;
 }
 
 export interface OrderResult {
@@ -244,6 +245,16 @@ export class SigClient {
 
   placeMultiLeg(legs: OrderInput[], idempotencyKey: string) {
     return this.write<{ results: { index: number; data: OrderResult }[] }>("/orders/multi-leg", "POST", { legs, idempotencyKey });
+  }
+
+  /** Cancel every open order of ours in one tournament (one write). */
+  cancelAll(tournamentId: string) {
+    return this.write<{ cancelled: number }>("/orders/cancel-all", "POST", { tournamentId });
+  }
+
+  /** Short-lived (3 h) Realtime token; counts as one write. */
+  realtimeToken() {
+    return this.write<{ token: string; expiresAt: string; supabaseUrl: string; anonKey: string; channels: { user: string } }>("/realtime/token", "POST");
   }
 
   cancelOrder(orderId: number | string) {

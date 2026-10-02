@@ -1,6 +1,6 @@
 # PredictionCup Bot
 
-Research and **paper-trading** system for the Susquehanna Predictions Cup (Midterm Elections tournament, starting bankroll 100,000 SUSQies). It monitors every SIG market, compares prices with Polymarket and Kalshi, estimates fair value, ranks all four actions (BUY/SELL × YES/NO) by risk-adjusted net edge, sizes positions within risk limits and simulates execution against the real order books. **No code path places orders on SIG.**
+Research, **paper-trading** and (opt-in) **live arbitrage trading** system for the Susquehanna Predictions Cup (Midterm Elections tournament, starting bankroll 100,000 SUSQies). It monitors every SIG market, compares prices with Polymarket and Kalshi, estimates fair value, ranks all four actions (BUY/SELL × YES/NO) by risk-adjusted net edge, sizes positions within risk limits and simulates execution against the real order books. Real orders are placed only when `LIVE_TRADING=1` (see *Live trading*).
 
 Built from `PREDICTIONCUP_SPEC.md`; this is the pre-Day-1 deliverable.
 
@@ -58,6 +58,14 @@ app/          Next.js UI + API routes
 - **Entries** need 1.5pp net edge (1pp lost money out of sample).
 - **Re-entry**: no adding to a position that is under water, and a 30 minute cool-down after a stop.
 - **Arbitrage**: shares bought as part of a set are locked: regular trades can't net against them and regular exits can't sell them. A held set is unwound early (all legs, limit-protected) once 60% of its locked profit can be sold back, which frees the capital for new sets. Sets are detected on the books net of our own fills, so the "depth gone before execution" skips no longer happen, and the arbitrage budget is up to 90% of equity (50% per race, 2% cash reserve).
+
+## Live trading
+
+- `LIVE_TRADING=1` + a read+trade key: the engine decides on its simulated execution client as in paper trading; every simulated fill is mirrored to SIG as a **limit** order at the worst price the simulation walked (arbitrage sets and unwinds as one atomic multi-leg request), remainders are cancelled, and positions/cash are reconciled from SIG after every batch and every 30 s.
+- Order books come from SIG Realtime (all 237 markets, full versioned books, no read budget); REST only resyncs gaps. Dashboard pages read the collector's memory, so they use no SIG reads.
+- Arbitrage only by default (`regularTrading: false`): directional trades and sniping lost money on the newest unseen data.
+- Arbitrage exits: the whole set is sold as soon as it can be sold back for its cost + 20% of its locked profit (min 0.2pp per set), walking the book as deep as it stays profitable; unequal legs (partial fills) are completed if still profitable, otherwise trimmed.
+- Safety: sells never exceed real holdings, one leg ≤ `LIVE_MAX_ORDER_NOTIONAL`, stale entries dropped, new entries halt at `LIVE_MAX_DRAWDOWN` below the starting account value. Stopping collection stops trading.
 
 ## Backtesting and auto-sizing
 

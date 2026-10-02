@@ -189,6 +189,10 @@ export interface PaperOrder {
   expiresAt: string | null;
   notes: string;
   tag?: string; // decision reason / trade type
+  /** orders that must execute together (an arbitrage set or unwind) share a group id */
+  group?: string;
+  /** worst level price walked by the simulated fill (contract terms): the live limit */
+  worstPrice?: number | null;
 }
 
 export interface Fill {

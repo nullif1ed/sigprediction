@@ -36,6 +36,8 @@ export class Portfolio {
    * sell these, and regular trades never net against them; they leave only by a full-set unwind.
    */
   arb = new Map<string, { quantity: number; cost: number }>();
+  /** raceId -> marketIds of every leg of the arbitrage set held in that race */
+  arbSets = new Map<string, string[]>();
   /** marketId -> epoch ms until which new regular entries are blocked (after a stop loss) */
   cooldownUntil = new Map<string, number>();
 
@@ -79,6 +81,43 @@ export class Portfolio {
     const next = { quantity: cur.quantity + q, cost: cur.cost + cost };
     if (next.quantity <= 0) this.arb.delete(k);
     else this.arb.set(k, next);
+  }
+
+  /**
+   * Replace positions and cash with the exchange's authoritative state (live trading). Local
+   * metadata (trade type, entry fair, exit state) is kept for positions that still exist, and
+   * arbitrage locks are clipped to what is really held.
+   */
+  syncFromExchange(rows: { marketId: string; contract: Contract; quantity: number; avgEntry: number; lots: { quantity: number; price: number }[] }[], cash: number, ts: string) {
+    const next = new Map<string, Position>();
+    for (const r of rows) {
+      if (r.quantity <= 0) continue;
+      const k = this.key(r.marketId, r.contract);
+      const prev = this.pos.get(k);
+      const lots = r.lots.length ? r.lots.map((l) => ({ ...l })) : [{ quantity: r.quantity, price: r.avgEntry }];
+      const sameQty = prev && Math.abs(prev.quantity - r.quantity) < 1e-9;
+      next.set(k, {
+        marketId: r.marketId,
+        contract: r.contract,
+        quantity: r.quantity,
+        avgEntry: r.avgEntry,
+        lots,
+        openedAt: prev?.openedAt ?? ts,
+        entryFair: prev?.entryFair ?? null,
+        entryLiquidationValue: prev?.entryLiquidationValue ?? null,
+        tradeType: prev?.tradeType ?? (this.arb.has(k) ? "arbitrage" : "regular"),
+        realizedPnl: prev?.realizedPnl ?? 0,
+        ...(sameQty ? { peakProfitPp: (prev as Position & { peakProfitPp?: number }).peakProfitPp, stopStrikes: (prev as Position & { stopStrikes?: number }).stopStrikes } : {}),
+      } as Position);
+    }
+    this.pos = next;
+    this.cash = cash;
+    for (const [k, v] of [...this.arb]) {
+      const held = this.pos.get(k)?.quantity ?? 0;
+      if (held <= 0) this.arb.delete(k);
+      else if (held < v.quantity) this.arb.set(k, { quantity: held, cost: (v.cost / v.quantity) * held });
+    }
+    for (const [race, ids] of [...this.arbSets]) if (!ids.some((id) => this.arb.has(`${id}:NO`) || this.arb.has(`${id}:YES`))) this.arbSets.delete(race);
   }
 
   arbExposure(): number {
@@ -252,11 +291,12 @@ export class Portfolio {
       maxDrawdown: this.maxDrawdown,
       positions: this.positions(),
       arb: [...this.arb.entries()],
+      arbSets: [...this.arbSets.entries()],
       cooldownUntil: [...this.cooldownUntil.entries()],
     };
   }
 
-  static fromJSON(j: Omit<ReturnType<Portfolio["toJSON"]>, "arb" | "cooldownUntil"> & Partial<Pick<ReturnType<Portfolio["toJSON"]>, "arb" | "cooldownUntil">>): Portfolio {
+  static fromJSON(j: Omit<ReturnType<Portfolio["toJSON"]>, "arb" | "cooldownUntil" | "arbSets"> & Partial<Pick<ReturnType<Portfolio["toJSON"]>, "arb" | "cooldownUntil" | "arbSets">>): Portfolio {
     const p = new Portfolio(j.initialCapital);
     p.cash = j.cash;
     p.realizedPnl = j.realizedPnl;
@@ -268,6 +308,7 @@ export class Portfolio {
       // Portfolios saved before arbitrage tracking: positions opened as arbitrage are fully locked.
       for (const x of j.positions) if (x.tradeType === "arbitrage") p.arb.set(`${x.marketId}:${x.contract}`, { quantity: x.quantity, cost: costBasis(x) });
     if (j.cooldownUntil) p.cooldownUntil = new Map(j.cooldownUntil);
+    if (j.arbSets) p.arbSets = new Map(j.arbSets);
     return p;
   }
 }

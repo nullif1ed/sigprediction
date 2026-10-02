@@ -27,7 +27,7 @@ function state(over: Partial<MarketState> = {}): MarketState {
 
 describe("strategy engine", () => {
   it("buys the underpriced side, sizes within limits and explains why", () => {
-    const cfg = mergeStrategy({ name: "t" });
+    const cfg = mergeStrategy({ name: "t", regularTrading: true });
     const s = state();
     const pf = new Portfolio(100_000);
     const ex = new PaperExecutionClient(pf);
@@ -58,7 +58,7 @@ describe("strategy engine", () => {
   it("trades a fresh headline once, tagged as a headline trade", () => {
     const h: NewsHeadline = { id: "h", marketId: "381", url: "", title: "Poll", source: "The New York Times", summary: "Democrat leading", publishedDate: "2026-10-02", relevanceExplanation: "raises the likelihood of a Democratic win and strengthens the lead", firstSeenAt: "2026-10-02T15:59:00Z" };
     const s = state({ books: new Map([["381", book("381", [[0.84, 2000]], [[0.86, 2000]])], ["382", book("382", [[0.13, 2000]], [[0.17, 2000]])]]), headlines: new Map([["381", [h]]]) });
-    const cfg = mergeStrategy({ name: "t" });
+    const cfg = mergeStrategy({ name: "t", regularTrading: true });
     const pf = new Portfolio(100_000);
     const ex = new PaperExecutionClient(pf);
     const traded = new Set<string>();
@@ -144,7 +144,7 @@ describe("sniping mispriced resting orders", () => {
         ["382", book("382", [[0.13, 2000]], [[0.17, 2000]])],
       ]),
     });
-    const cfg = mergeStrategy({ name: "t", minNetEdge: 9 }); // isolate the snipe step
+    const cfg = mergeStrategy({ name: "t", minNetEdge: 9, snipe: true }); // isolate the snipe step
     const pf = new Portfolio(100_000);
     const ex = new PaperExecutionClient(pf);
     const r = runPortfolioTick({ state: s, signals: computeSignals(s, cfg), cfg, portfolio: pf, exec: ex, sizingMode: "auto", rules: null, tradedHeadlines: new Set() });
