@@ -500,10 +500,29 @@ export function runPortfolioTick(args: {
     });
     for (const al of allocations) {
       const a = al.arb;
+      // Exit-liquidity cap: never hold more sets than the sell-back side can absorb near its best.
+      let maxQty = al.quantity;
+      if (cfg.risk.arbExitDepthMultiple > 0) {
+        const exitLegs = a.legs.map((l) => ({
+          marketId: l.marketId,
+          action: (l.action === "BUY_NO" ? "SELL_NO" : "SELL_YES") as Action,
+          book: exec.book(l.marketId)!,
+          held: Number.MAX_SAFE_INTEGER,
+        }));
+        const best = exitLegs.reduce((sum, l) => sum + (contractLevels(l.book, l.action)[0]?.price ?? 0), 0);
+        const depth = sizeUnwind(exitLegs, best - cfg.risk.arbExitBandPp)?.q ?? 0;
+        const c = a.legs[0].action.endsWith("YES") ? "YES" : "NO";
+        const held = Math.max(0, ...a.legs.map((l) => portfolio.arbQty(l.marketId, c)));
+        maxQty = Math.min(maxQty, Math.floor(cfg.risk.arbExitDepthMultiple * depth) - held);
+        if (maxQty < cfg.risk.minQuantity) {
+          out.logs.push({ level: "INFO", message: `ARB ${a.raceId} capped by exit liquidity: hold ${held}, sell-back depth ${depth} sets`, context: { raceId: a.raceId } });
+          continue;
+        }
+      }
       const live = sizeSet(
         a.legs.map((l) => ({ marketId: l.marketId, action: l.action, book: exec.book(l.marketId)! })).filter((x) => x.book),
         a.guaranteedPayoutPerSet,
-        al.quantity,
+        maxQty,
       );
       if (!live || live.legs.length !== a.legs.length || live.q < cfg.risk.minQuantity) {
         out.logs.push({ level: "WARNING", message: `ARB ${a.raceId} skipped: depth gone before execution`, context: { raceId: a.raceId } });

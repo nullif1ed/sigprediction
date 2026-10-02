@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config";
 import { log } from "./log";
 import { SigApiError, type OrderInput, type OrderResult, type SigClient } from "./sigClient";
-import type { Contract, PaperOrder, SigMarket } from "../core/types";
+import type { Contract, PaperOrder, SigMarket, YesBook } from "../core/types";
 import type { Portfolio } from "../core/portfolio";
-import { round } from "../core/orderbook";
+import { availableQuantity, round } from "../core/orderbook";
 import { raceId } from "../core/races";
 
 // LIVE execution on SIG.
@@ -92,6 +92,8 @@ export class LiveTrader {
      * including a lone leg whose partner never filled: adopt it so leg repair balances it.
      */
     private allPositionsAreArb: () => boolean = () => false,
+    /** current (fresh) book for a market, used to pick the bottleneck leg */
+    private getBook: (marketId: string) => YesBook | undefined = () => undefined,
   ) {}
 
   /** Called for every order the engine's execution client creates. */
@@ -292,6 +294,8 @@ export class LiveTrader {
       const q = Math.min(...legs.map((l) => l.input.quantity));
       for (const l of legs) l.input.quantity = q;
     }
+    const entrySet = legs.length > 1 && legs.every((l) => l.input.action === "buy") && /^arbitrage:arbitrage/.test(legs[0].o.tag ?? "");
+    if (entrySet) return this.sendSequential(legs);
     const key = `pc-${randomUUID()}`;
     this.stats.ordersSent += legs.length;
     let results: OrderResult[];
@@ -335,6 +339,55 @@ export class LiveTrader {
       });
     });
     return open;
+  }
+
+  /**
+   * Arbitrage entry, one leg at a time. Live, SIG answers in 10-20 s and other bots take the cheap
+   * leg meanwhile, so a simultaneous multi-leg request filled legs unevenly (TX-15: 424 vs 124).
+   *  1. Buy the BOTTLENECK leg first (least depth at its limit relative to the size).
+   *  2. Every next leg buys exactly the quantity filled so far, with a limit that still keeps the
+   *     whole set profitable: payout - prices paid - planned prices of the remaining legs - 0.1pp.
+   *  3. Each leg's unfilled remainder is cancelled before the next leg.
+   * A leg that cannot be completed profitably is left to leg repair (complete or trim by value).
+   */
+  private async sendSequential(legs: { o: PaperOrder; input: OrderInput }[]): Promise<boolean> {
+    const payout = legs[0].input.side === "no" ? legs.length - 1 : 1;
+    const ratio = (l: { o: PaperOrder; input: OrderInput }) => {
+      const b = this.getBook(l.o.marketId);
+      if (!b) return 1;
+      return availableQuantity(b, l.o.action, l.input.price) / Math.max(1, l.input.quantity);
+    };
+    const order = [...legs].sort((a, b) => ratio(a) - ratio(b));
+    let qty = order[0].input.quantity;
+    let paid = 0; // per-set price paid on legs filled so far
+    for (let i = 0; i < order.length && qty >= 1; i++) {
+      const l = order[i];
+      const laterPlanned = order.slice(i + 1).reduce((s, x) => s + (x.input.price ?? 0), 0);
+      const cap = i === 0 ? l.input.price! : onTick(payout - paid - laterPlanned - 0.001, "down");
+      if (cap < 0.005) break;
+      const input = { ...l.input, quantity: Math.floor(qty), price: i === 0 ? l.input.price : Math.max(cap, 0.005) };
+      this.stats.ordersSent++;
+      let r: OrderResult;
+      try {
+        r = await this.client.placeOrder({ ...input, idempotencyKey: `pc-${randomUUID()}` });
+      } catch (e) {
+        if (e instanceof SigApiError && e.status === 409) this.lastReconcile = 0;
+        this.fail("order_failed", e, { leg: input });
+        return true;
+      }
+      const filled = Number(r.quantityTraded ?? 0);
+      if (r.open && r.orderId) await this.client.cancelOrder(r.orderId).catch((e) => this.fail("cancel_failed", e));
+      log("INFO", "live", "order", { marketId: l.o.marketId, tag: l.o.tag, step: i + 1, of: order.length, side: input.side, action: input.action, quantity: input.quantity, limit: input.price, filled, fillPrice: r.fillPrice, open: r.open, orderId: r.orderId });
+      if (filled > 0) {
+        this.stats.ordersFilled++;
+        this.stats.sharesFilled += filled;
+        const k = `${l.o.marketId}:${l.o.contract}`;
+        this.real.set(k, (this.real.get(k) ?? 0) + filled);
+        paid += r.fillPrice ?? input.price ?? 0;
+      }
+      qty = Math.min(qty, filled);
+    }
+    return false;
   }
 
   private fail(event: string, e: unknown, ctx: Record<string, unknown> = {}) {
