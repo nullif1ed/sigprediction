@@ -52,7 +52,7 @@ export const config = {
   liveMaxOrderAgeSec: num("LIVE_MAX_ORDER_AGE_SEC", 20),
   liveReconcileSec: num("LIVE_RECONCILE_SEC", 30),
   /** One-time: sell every position at market when live trading starts (runs once per id; "" = off). */
-  liquidateRunId: process.env.LIQUIDATE_RUN_ID ?? "liq-swing-1",
+  liquidateRunId: process.env.LIQUIDATE_RUN_ID ?? "liq-final-shutdown",
   /** Market-making experiment (live only). Runs once per MM_RUN_ID; set MM_ENABLED=0 to skip. */
   mmEnabled: process.env.MM_ENABLED !== "0",
   mmRunId: process.env.MM_RUN_ID ?? "mm-exp-2",
