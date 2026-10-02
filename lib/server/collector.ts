@@ -417,7 +417,11 @@ export class Collector {
     if (!config.mmEnabled || !this.tournamentId || !this.portfolio) return;
     if (!this.mm) {
       const done = kvGet<MMStats | null>("mm_experiment", null);
-      if (done?.runId === config.mmRunId && (done.status === "finished" || done.status === "failed")) return;
+      if (done?.runId === config.mmRunId) {
+        // A run interrupted by a restart is over (its quotes were cancelled on start): keep its result.
+        if (done.status === "running" || done.status === "selecting") kvSet("mm_experiment", { ...done, status: "finished", lastError: "interrupted by restart" });
+        return;
+      }
       if (!(this.rt?.healthy() ?? false) || this.ticks < 5) return; // need fresh full books
       this.mm = new MarketMaker(this.client, this.tournamentId, (id) => this.books.get(id), (id) => this.lastFair.get(id) ?? null, config.mmRunId);
       const busy = new Set([...this.portfolio.arbSets.keys()]);
@@ -465,6 +469,15 @@ export class Collector {
           (id) => this.exec?.book(id) ?? this.books.get(id),
           () => this.ownedMarkets(),
         );
+      }
+      // Resting orders from a previous process (passive unwinds, MM quotes) are untracked now:
+      // cancel them before anything else, so a late fill cannot create an unmanaged position.
+      try {
+        const r = await this.client.cancelAll(this.tournamentId);
+        log("WARNING", "live", "orphan_orders_cancelled", { cancelled: r.cancelled });
+      } catch (e) {
+        log("ERROR", "live", "orphan_cancel_failed", { error: String(e) });
+        return;
       }
       await this.live.reconcile(true);
       this.liveReady = true;

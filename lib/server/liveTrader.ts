@@ -182,7 +182,8 @@ export class LiveTrader {
       if (members.length < 2 || pf.arbSets.has(race) || members.some((m) => skip.has(m.id))) continue;
       // Mixed YES/NO holdings are a directional position, not a set: never adopt them.
       if (members.some((m) => pf.holdings(m.id).YES > 0) && members.some((m) => pf.holdings(m.id).NO > 0)) continue;
-      for (const c of ["NO", "YES"] as Contract[]) {
+      // Only buy-all-NO sets exist (buy-all-YES is off): never adopt YES holdings as a set.
+      for (const c of ["NO"] as Contract[]) {
         const free = members.map((m) => pf.freeHoldings(m.id)[c]);
         const need = this.allPositionsAreArb() ? Math.max(...free) : Math.min(...free);
         if (need < 1) continue;
@@ -370,9 +371,16 @@ export class LiveTrader {
     for (let i = 0; i < order.length && qty >= 1; i++) {
       const l = order[i];
       const laterPlanned = order.slice(i + 1).reduce((s, x) => s + (x.input.price ?? 0), 0);
-      const cap = i === 0 ? l.input.price! : onTick(payout - paid - laterPlanned - 0.001, "down");
+      // Marketable limits (they take the best available prices at once, like a market order) capped
+      // at the price that still leaves the whole set profitable. The first leg may pay up to half
+      // of the planned profit more than planned; later legs up to break-even + 0.1pp.
+      const planned = order.reduce((s, x) => s + (x.input.price ?? 0), 0);
+      const cap =
+        i === 0
+          ? Math.max(l.input.price!, onTick(l.input.price! + Math.max(0, payout - planned - 0.002) / 2, "down"))
+          : onTick(payout - paid - laterPlanned - 0.001, "down");
       if (cap < 0.005) break;
-      const input = { ...l.input, quantity: Math.floor(qty), price: i === 0 ? l.input.price : Math.max(cap, 0.005) };
+      const input = { ...l.input, quantity: Math.floor(qty), price: Math.max(cap, 0.005) };
       this.stats.ordersSent++;
       let r: OrderResult;
       try {
