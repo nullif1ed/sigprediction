@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { openDb, setDb, db, kvGet } from "@/lib/server/db";
+import { config } from "@/lib/server/config";
 import { SigClient } from "@/lib/server/sigClient";
 import { Collector } from "@/lib/server/collector";
 import { resetStoreCache, dataRange, latestBooks } from "@/lib/server/store";
@@ -61,6 +62,9 @@ describe("collector -> paper trading -> backtest (mock API)", () => {
 
   it("collects snapshots, external quotes and news, and paper trades within limits", async () => {
     const client = new SigClient({ apiKey: "k", baseUrl: "https://sig.test/api/v1", siteUrl: "https://sig.test", fetchFn: (async (u: string) => sigFetch(u)) as unknown as typeof fetch, sleep: async () => {}, readsPerMinute: 10_000 });
+    // Headlines are off by default (NEWS_MARKETS_PER_MIN=0); this test covers the opt-in path.
+    const newsBefore = config.newsMarketsPerMinute;
+    config.newsMarketsPerMinute = 12;
     const c = new Collector(client, () => new Date(now));
     c.paperTrading = true;
     c.strategy = mergeStrategy({ yolo: false, name: "it", regularTrading: true });
@@ -69,6 +73,7 @@ describe("collector -> paper trading -> backtest (mock API)", () => {
       await c.tick();
       now += 5000;
     }
+    config.newsMarketsPerMinute = newsBefore;
     const range = dataRange();
     expect(range.snapshots).toBeGreaterThan(nhAsk.length);
     expect(range.markets).toBe(13);
