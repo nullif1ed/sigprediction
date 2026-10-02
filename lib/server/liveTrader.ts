@@ -94,6 +94,8 @@ export class LiveTrader {
     private allPositionsAreArb: () => boolean = () => false,
     /** current (fresh) book for a market, used to pick the bottleneck leg */
     private getBook: (marketId: string) => YesBook | undefined = () => undefined,
+    /** markets owned by the market maker: not inferred/adopted as arbitrage */
+    private skipMarkets: () => Set<string> = () => new Set(),
   ) {}
 
   /** Called for every order the engine's execution client creates. */
@@ -173,8 +175,9 @@ export class LiveTrader {
   private inferSets(pf: Portfolio) {
     const byRace = new Map<string, SigMarket[]>();
     for (const m of this.markets()) if (m.race) byRace.set(raceId(m.race), [...(byRace.get(raceId(m.race)) ?? []), m]);
+    const skip = this.skipMarkets();
     for (const [race, members] of byRace) {
-      if (members.length < 2 || pf.arbSets.has(race)) continue;
+      if (members.length < 2 || pf.arbSets.has(race) || members.some((m) => skip.has(m.id))) continue;
       for (const c of ["NO", "YES"] as Contract[]) {
         const free = members.map((m) => pf.freeHoldings(m.id)[c]);
         const need = this.allPositionsAreArb() ? Math.max(...free) : Math.min(...free);

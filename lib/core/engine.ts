@@ -202,6 +202,8 @@ export function runPortfolioTick(args: {
   onDecision?: (d: Decision) => void;
   /** books used for fills (e.g. the book after simulated latency); defaults to state.books */
   execBooks?: Map<string, YesBook>;
+  /** markets owned by another strategy (market making): never traded or exited here */
+  skipMarkets?: Set<string>;
 }): TickResult {
   const { state, signals, cfg, portfolio, exec } = args;
   const out: TickResult = { decisions: [], exits: [], evaluated: 0, logs: [] };
@@ -210,7 +212,10 @@ export function runPortfolioTick(args: {
   const ts = state.now.toISOString();
 
   // 1. Re-evaluate and exit existing positions (arbitrage-locked shares are managed separately).
+  const skip = args.skipMarkets ?? new Set<string>();
+  const skipRaces = new Set(state.markets.filter((m) => skip.has(m.id) && m.race).map((m) => raceId(m.race!)));
   for (const p of portfolio.positions()) {
+    if (skip.has(p.marketId)) continue;
     const free = p.quantity - portfolio.arbQty(p.marketId, p.contract);
     if (free <= 0) continue;
     const m = titles.get(p.marketId);
@@ -453,7 +458,7 @@ export function runPortfolioTick(args: {
   const liveArbs = cfg.arbitrage
     ? detectArbitrage(
         state.markets
-          .filter((m) => m.race && exec.book(m.id))
+          .filter((m) => m.race && exec.book(m.id) && !skipRaces.has(raceId(m.race)))
           .map((m) => ({ marketId: m.id, race: m.race!, book: exec.book(m.id)! })),
       )
     : [];
@@ -644,7 +649,7 @@ export function runPortfolioTick(args: {
 
   // 4. Regular opportunities across the whole universe.
   const all: Opportunity[] = [];
-  for (const m of cfg.regularTrading ? state.markets : []) {
+  for (const m of cfg.regularTrading ? state.markets.filter((x) => !skip.has(x.id)) : []) {
     const f = signals.fair.get(m.id);
     const book = exec.book(m.id);
     if (!f || !book) continue;

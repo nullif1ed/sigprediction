@@ -45,7 +45,7 @@ export const DEFAULT_RISK: RiskConfig = {
   minQuantity: 10,
   headlineMultiplier: 1.5,
   maxArbitragePct: 0.98,
-  maxArbRacePct: 0.3,
+  maxArbRacePct: 0.15,
   cashReservePct: 0.01,
   minArbReturn: 0.003,
   minArbReturnPerUtil: 0.01,

@@ -51,6 +51,17 @@ export const config = {
   /** live entries older than this when their turn to be sent comes are dropped (stale) */
   liveMaxOrderAgeSec: num("LIVE_MAX_ORDER_AGE_SEC", 20),
   liveReconcileSec: num("LIVE_RECONCILE_SEC", 30),
+  /** Market-making experiment (live only). Runs once per MM_RUN_ID; set MM_ENABLED=0 to skip. */
+  mmEnabled: process.env.MM_ENABLED !== "0",
+  mmRunId: process.env.MM_RUN_ID ?? "mm-exp-1",
+  mmMarkets: num("MM_MARKETS", 3),
+  mmSize: num("MM_SIZE", 500),
+  mmMaxPos: num("MM_MAX_POS", 2000),
+  mmMinSpread: num("MM_MIN_SPREAD", 0.02),
+  mmMinEdge: num("MM_MIN_EDGE", 0.005),
+  mmMinutes: num("MM_MINUTES", 60),
+  mmRefreshSec: num("MM_REFRESH_SEC", 10),
+  mmWritesReserve: num("MM_WRITES_RESERVE", 8),
   /** Read-only token for GET /api/export/db (database download for offline backtests). Empty disables it. */
   get exportToken() {
     return process.env.BOT_EXPORT_TOKEN ?? "";

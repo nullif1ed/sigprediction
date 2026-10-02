@@ -247,9 +247,21 @@ export class SigClient {
     return this.write<{ results: { index: number; data: OrderResult }[] }>("/orders/multi-leg", "POST", { legs, idempotencyKey });
   }
 
-  /** Cancel every open order of ours in one tournament (one write). */
-  cancelAll(tournamentId: string) {
-    return this.write<{ cancelled: number }>("/orders/cancel-all", "POST", { tournamentId });
+  /** Cancel every open order of ours in one tournament, optionally one market (one write). */
+  cancelAll(tournamentId: string, marketId?: string) {
+    return this.write<{ cancelled: number }>("/orders/cancel-all", "POST", marketId ? { tournamentId, marketId } : { tournamentId });
+  }
+
+  async openOrders(tournamentId: string) {
+    const r = await this.api<{ data: { id: number | string; exchangeId: string; side: string; action: string; quantity: number; priceLimit: number | null; open: boolean }[] }>(
+      `/orders?status=open&limit=100&tournamentId=${encodeURIComponent(tournamentId)}`,
+      { timeoutMs: Math.max(this.timeoutMs, 15_000), maxRetries: 1 },
+    );
+    return r.data ?? [];
+  }
+
+  getOrder(orderId: number | string) {
+    return this.api<{ id: number; quantity: number; open: boolean }>(`/orders/${encodeURIComponent(String(orderId))}`, { timeoutMs: Math.max(this.timeoutMs, 15_000), maxRetries: 1 });
   }
 
   /** Short-lived (3 h) Realtime token; counts as one write. */
