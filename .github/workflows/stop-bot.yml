@@ -1,0 +1,27 @@
+name: Stop bot on droplet
+
+# One-off: stops the pm2 process entirely (no live trading, no process running at all).
+# Used when moving off cloud hosting back to local.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up SSH key
+        env:
+          KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+
+      - name: Stop pm2 process
+        env:
+          HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key root@$HOST "pm2 stop sigprediction; pm2 save; pm2 list"
