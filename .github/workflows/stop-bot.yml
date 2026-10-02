@@ -1,7 +1,7 @@
 name: Stop bot on droplet
 
-# One-off: stops the pm2 process entirely (no live trading, no process running at all).
-# Used when moving off cloud hosting back to local.
+# One-off: calls the collector's stop API (sets collector_desired=false, so instrumentation.ts
+# will not auto-resume it on the next process start), THEN stops the pm2 process entirely.
 on:
   workflow_dispatch: {}
 
@@ -20,8 +20,21 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
 
-      - name: Stop pm2 process
+      - name: Stop collector properly, then stop pm2
         env:
           HOST: ${{ secrets.DROPLET_HOST }}
         run: |
-          ssh -i ~/.ssh/deploy_key root@$HOST "pm2 stop sigprediction; pm2 save; pm2 list"
+          ssh -i ~/.ssh/deploy_key root@$HOST "bash -se" <<'INNER'
+          set -euo pipefail
+          cd ~/sigprediction
+          ADMIN=$(grep '^BOT_ADMIN_TOKEN=' .env.local | head -1 | cut -d= -f2- || true)
+          echo "Calling stop API (sets collector_desired=false)..."
+          curl -s -X POST localhost:3000/api/collector -H 'content-type: application/json' -H "x-bot-token: $ADMIN" -d '{"action":"stop"}'
+          echo
+          sleep 3
+          curl -s localhost:3000/api/collector | grep -o '"running":[a-z]*' || true
+          echo "Stopping pm2 process..."
+          pm2 stop sigprediction
+          pm2 save
+          pm2 list
+          INNER
